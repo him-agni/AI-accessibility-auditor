@@ -12,6 +12,11 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Build and deploy artifacts — bundled output, not source.
+    "dist/**",
+    ".sites/**",
+    ".wrangler/**",
+    "examples/**",
   ]),
 ]);
 

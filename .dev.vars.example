@@ -1,0 +1,9 @@
+# Copy to `.dev.vars` (gitignored) for local development.
+# Wrangler/Miniflare loads `.dev.vars` into the Worker env automatically.
+#
+# Free Gemini key: https://aistudio.google.com/apikey
+# Leave GEMINI_API_KEY unset to run on deterministic axe/WCAG guidance only.
+
+GEMINI_API_KEY=
+# Optional. Defaults to gemini-2.5-flash. Any free-tier text model works.
+GEMINI_MODEL=gemini-2.5-flash

@@ -1,10 +1,16 @@
 /** Cloudflare Worker entry point for the Clarity product preview. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { buildFindings } from "../lib/fixes";
+import { representativeFindings } from "../lib/findings/representative";
 
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  /** Google AI Studio key. Absent is valid: reports fall back to deterministic guidance. */
+  GEMINI_API_KEY?: string;
+  /** Optional free-tier model override, e.g. "gemini-2.0-flash". */
+  GEMINI_MODEL?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -19,11 +25,13 @@ interface ExecutionContext {
   passThroughOnException(): void;
 }
 
+type AuditStatus = "queued" | "running" | "generating" | "completed" | "failed";
+
 type AuditRow = {
   id: string;
   submitted_url: string;
   final_url: string | null;
-  status: "queued" | "running" | "completed" | "failed";
+  status: AuditStatus;
   page_title: string | null;
   report_json: string | null;
   error_message: string | null;
@@ -55,6 +63,10 @@ const SCHEMA = [
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
+/** Preview pacing. Replace both with real queue events once the scanner worker exists. */
+const RUNNING_AFTER_MS = 700;
+const GENERATE_AFTER_MS = 2100;
+
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
@@ -77,49 +89,15 @@ async function fingerprint(request: Request) {
   return [...new Uint8Array(hash)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function ensureDatabase(db: D1Database) {
-  await db.batch(SCHEMA.map((statement) => db.prepare(statement)));
-}
+/** Bootstrap DDL runs at most once per isolate, not once per request. */
+let schemaReady: Promise<unknown> | null = null;
 
-function representativeFindings() {
-  const wcag = (label: string, slug: string) => [{ label, href: `https://www.w3.org/WAI/WCAG22/Understanding/${slug}.html` }];
-  return [
-    {
-      ruleId: "button-name", impact: "critical", title: "Buttons must have discernible text", count: 2,
-      explanation: "Two icon-only buttons have no accessible name. Screen-reader users hear only “button” and cannot tell what each control does.",
-      wcag: wcag("4.1.2 Name, Role, Value", "name-role-value"),
-      occurrences: [{ selector: ".site-header > button.cart-toggle", html: "<button class=\"cart-toggle\"><span class=\"cart-icon\"></span></button>", failure: "Element does not have inner text, an aria-label, or an aria-labelledby attribute." }, { selector: ".search-panel > button.close", html: "<button class=\"close\"><span aria-hidden=\"true\">×</span></button>", failure: "Element does not have an accessible name." }],
-      fix: { summary: "Give each icon button a short, action-oriented accessible name.", whyItMatters: "Assistive technology needs a programmatic name even when an icon communicates meaning visually.", steps: ["Add aria-label to icon-only controls.", "Describe the action, such as “Open cart”.", "Retest open and closed states."], codeExample: "<button aria-label=\"Open cart\">\n  <span class=\"cart-icon\" aria-hidden=\"true\"></span>\n</button>", confidence: "high", requiresManualReview: true },
-    },
-    {
-      ruleId: "color-contrast", impact: "serious", title: "Text must meet minimum color contrast", count: 12,
-      explanation: "Several text elements do not have enough contrast against their backgrounds, making them difficult to read for people with low vision.",
-      wcag: wcag("1.4.3 Contrast (Minimum)", "contrast-minimum"),
-      occurrences: [{ selector: ".product-card .eyebrow", html: "<span class=\"eyebrow\">New arrival</span>", failure: "Insufficient contrast of 2.61:1. Expected 4.5:1 for this text size." }, { selector: ".footer .legal-link", html: "<a class=\"legal-link\" href=\"/returns\">Returns</a>", failure: "Insufficient contrast of 3.02:1. Expected 4.5:1." }],
-      fix: { summary: "Darken the muted text color until normal text reaches at least 4.5:1.", whyItMatters: "Low-contrast text can disappear for users with low vision or color-vision differences.", steps: ["Update the shared muted text token.", "Verify normal text reaches 4.5:1.", "Check hover, focus, and dark-mode states."], codeExample: ":root {\n  --text-muted: #5b625e;\n}", confidence: "medium", requiresManualReview: true },
-    },
-    {
-      ruleId: "image-alt", impact: "serious", title: "Images must have alternative text", count: 3,
-      explanation: "Three images are missing alt attributes. Their purpose cannot be determined from markup alone.",
-      wcag: wcag("1.1.1 Non-text Content", "non-text-content"),
-      occurrences: [{ selector: ".hero-promo > img", html: "<img src=\"/summer-collection.webp\">", failure: "Element does not have an alt attribute." }, { selector: ".product-card:nth-child(2) img", html: "<img src=\"/linen-shirt.webp\">", failure: "Element does not have an alt attribute." }],
-      fix: { summary: "Decide whether each image is informative, functional, or decorative before adding alt text.", whyItMatters: "Good alternative text depends on the image’s purpose in this context.", steps: ["Describe meaningful images concisely.", "Use alt=\"\" for decorative images.", "Avoid repeating nearby text."], codeExample: null, confidence: "low", requiresManualReview: true },
-    },
-    {
-      ruleId: "label", impact: "serious", title: "Form inputs must have labels", count: 4,
-      explanation: "Four fields are missing programmatically associated labels, so their purpose may be unclear outside the visual layout.",
-      wcag: wcag("3.3.2 Labels or Instructions", "labels-or-instructions"),
-      occurrences: [{ selector: "#newsletter-email", html: "<input id=\"newsletter-email\" type=\"email\" placeholder=\"Email address\">", failure: "Form element does not have an implicit or explicit label." }, { selector: "#search-products", html: "<input id=\"search-products\" type=\"search\">", failure: "Form element does not have an accessible name." }],
-      fix: { summary: "Associate a visible label with every input.", whyItMatters: "Labels give assistive technology a reliable field name.", steps: ["Add a visible label.", "Match for to the input id.", "Keep placeholders as examples only."], codeExample: "<label for=\"newsletter-email\">Email address</label>\n<input id=\"newsletter-email\" type=\"email\">", confidence: "high", requiresManualReview: true },
-    },
-    {
-      ruleId: "html-has-lang", impact: "moderate", title: "The page must declare a language", count: 1,
-      explanation: "The html element has no lang attribute. Screen readers may use the wrong pronunciation rules.",
-      wcag: wcag("3.1.1 Language of Page", "language-of-page"),
-      occurrences: [{ selector: "html", html: "<html>", failure: "The html element does not have a lang attribute." }],
-      fix: { summary: "Set the page’s primary human language on the html element.", whyItMatters: "Assistive technology uses this value to select pronunciation rules.", steps: ["Set lang to the primary language code.", "Mark foreign-language passages separately."], codeExample: "<html lang=\"en\">", confidence: "high", requiresManualReview: false },
-    },
-  ];
+function ensureDatabase(db: D1Database) {
+  schemaReady ??= db.batch(SCHEMA.map((statement) => db.prepare(statement))).catch((error) => {
+    schemaReady = null;
+    throw error;
+  });
+  return schemaReady;
 }
 
 async function handleApi(request: Request, env: Env, url: URL) {
@@ -153,24 +131,43 @@ async function handleApi(request: Request, env: Env, url: URL) {
     const row = await env.DB.prepare("SELECT id, submitted_url, final_url, status, page_title, report_json, error_message, created_at, completed_at FROM audits WHERE id = ? AND expires_at > ?").bind(match[1], Date.now()).first<AuditRow>();
     if (!row) return json({ error: "This report was not found or has expired." }, 404);
 
+    const createdAt = new Date(row.created_at).toISOString();
+    const progress = (status: AuditStatus) => json({ id: row.id, url: row.submitted_url, status, createdAt, findings: [] });
+
     const elapsed = Date.now() - row.created_at;
-    if (row.status === "queued" && elapsed > 700) {
-      await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ?").bind(Date.now(), row.id).run();
+    if (row.status === "queued" && elapsed > RUNNING_AFTER_MS) {
+      await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'").bind(Date.now(), row.id).run();
       row.status = "running";
     }
-    if ((row.status === "queued" || row.status === "running") && elapsed > 2100) {
+
+    if ((row.status === "queued" || row.status === "running") && elapsed > GENERATE_AFTER_MS) {
+      // Claim the transition so concurrent pollers cannot each spend a model request.
+      const claim = await env.DB.prepare("UPDATE audits SET status = 'generating' WHERE id = ? AND status IN ('queued', 'running')").bind(row.id).run();
+      if (claim.meta.changes === 0) return progress("generating");
+
       let host = "Scanned page";
       try { host = new URL(row.submitted_url).hostname; } catch { /* normalized on input */ }
-      const findings = representativeFindings();
-      const completedAt = Date.now();
-      await env.DB.prepare("UPDATE audits SET status = 'completed', final_url = ?, page_title = ?, axe_version = ?, report_json = ?, completed_at = ? WHERE id = ?")
-        .bind(row.submitted_url, `${host} — scanned page`, "4.x", JSON.stringify(findings), completedAt, row.id).run();
-      return json({ id: row.id, url: row.submitted_url, finalUrl: row.submitted_url, pageTitle: `${host} — scanned page`, status: "completed", createdAt: new Date(row.created_at).toISOString(), completedAt: new Date(completedAt).toISOString(), findings, prototype: true });
+      const pageTitle = `${host} — scanned page`;
+
+      try {
+        const findings = await buildFindings(representativeFindings(), env, (message) => console.warn(`[fixes] audit ${row.id}: ${message}`));
+        const completedAt = Date.now();
+        await env.DB.prepare("UPDATE audits SET status = 'completed', final_url = ?, page_title = ?, axe_version = ?, report_json = ?, completed_at = ? WHERE id = ?")
+          .bind(row.submitted_url, pageTitle, "4.x", JSON.stringify(findings), completedAt, row.id).run();
+        return json({ id: row.id, url: row.submitted_url, finalUrl: row.submitted_url, pageTitle, status: "completed", createdAt, completedAt: new Date(completedAt).toISOString(), findings, prototype: true });
+      } catch (error) {
+        // Never leave a claimed audit stuck in 'generating'.
+        console.error(`[fixes] audit ${row.id} failed`, error);
+        const message = "The report could not be generated. Try scanning this page again.";
+        await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ?")
+          .bind("report_generation_failed", message, Date.now(), row.id).run();
+        return json({ id: row.id, url: row.submitted_url, status: "failed", createdAt, findings: [], error: message });
+      }
     }
 
-    if (row.status === "completed") return json({ id: row.id, url: row.submitted_url, finalUrl: row.final_url, pageTitle: row.page_title, status: row.status, createdAt: new Date(row.created_at).toISOString(), completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined, findings: row.report_json ? JSON.parse(row.report_json) : [], prototype: true });
-    if (row.status === "failed") return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt: new Date(row.created_at).toISOString(), findings: [], error: row.error_message || "The scan failed." });
-    return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt: new Date(row.created_at).toISOString(), findings: [] });
+    if (row.status === "completed") return json({ id: row.id, url: row.submitted_url, finalUrl: row.final_url, pageTitle: row.page_title, status: row.status, createdAt, completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined, findings: row.report_json ? JSON.parse(row.report_json) : [], prototype: true });
+    if (row.status === "failed") return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt, findings: [], error: row.error_message || "The scan failed." });
+    return progress(row.status);
   }
 
   return json({ error: "Not found" }, 404);
