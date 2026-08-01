@@ -29,7 +29,7 @@ npx tsc --noEmit
 
 ## Data
 
-Cloudflare D1 stores audit records and supports the issue-group, occurrence, and fix-suggestion model. Generated migrations are in `db/migrations`. Anonymous results expire after seven days and submissions are limited to three per hour per request fingerprint.
+Cloudflare D1 stores audit records and supports the issue-group, occurrence, and fix-suggestion model. Generated migrations are in `drizzle`. Anonymous results expire after seven days and submissions are limited to three per hour per request fingerprint.
 
 ## Production scanner boundary
 
