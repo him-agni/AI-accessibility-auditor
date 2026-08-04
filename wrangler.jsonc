@@ -1,0 +1,38 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clarity-accessibility-scanner",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-05-15",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The Vite plugin fills in the directory from the client build output.
+  // Declare only the binding here; setting `directory` conflicts with it.
+  "assets": {
+    "binding": "ASSETS"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "clarity-accessibility-scanner",
+      // Placeholder. Replace with the id from `wrangler d1 create clarity-accessibility-scanner`
+      // before the first deploy — `wrangler dev` and the test suite do not need a real one.
+      "database_id": "00000000-0000-4000-8000-000000000000",
+      "migrations_dir": "drizzle"
+    }
+  ],
+
+  // Backs the /_vinext/image route. Remove this binding if the account does not
+  // have Images enabled; nothing else in the product depends on it today.
+  "images": {
+    "binding": "IMAGES"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+
+  // GEMINI_API_KEY and GEMINI_MODEL are NOT declared here. Set them with
+  // `wrangler secret put GEMINI_API_KEY`, or locally in the gitignored `.dev.vars`.
+  // Never commit a key.
+}

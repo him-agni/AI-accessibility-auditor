@@ -4,7 +4,7 @@ export const audits = sqliteTable("audits", {
   id: text("id").primaryKey(),
   submittedUrl: text("submitted_url").notNull(),
   finalUrl: text("final_url"),
-  status: text("status", { enum: ["queued", "running", "completed", "failed"] }).notNull(),
+  status: text("status", { enum: ["queued", "running", "generating", "completed", "failed"] }).notNull(),
   pageTitle: text("page_title"),
   viewport: text("viewport").notNull().default("1440x900"),
   axeVersion: text("axe_version"),

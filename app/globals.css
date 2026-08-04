@@ -60,6 +60,7 @@ a { color: inherit; }
 .form-error { color: var(--critical); margin: 10px 7px 0; font-size: 13px; font-weight: 700; }
 .trust-row { display: flex; justify-content: center; gap: 30px; margin-top: 27px; color: #5c6c66; font-size: 12px; }
 .trust-row b { display: inline-grid; place-items: center; background: #deebd5; color: var(--green); width: 17px; height: 17px; border-radius: 50%; margin-right: 5px; }
+.hero-preview-note { max-width: 620px; margin: 24px auto 0; text-align: left; }
 
 .report-preview { margin-top: -100px; padding: 0 24px 115px; position: relative; z-index: 2; }
 .preview-window { max-width: 1110px; margin: auto; background: var(--paper); border: 1px solid #c9cec3; border-radius: 14px; overflow: hidden; box-shadow: 0 30px 75px rgba(26,53,44,.15); transform: perspective(1200px) rotateX(1deg); transform-origin: top; }

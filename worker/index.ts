@@ -66,21 +66,47 @@ const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache
 /** Preview pacing. Replace both with real queue events once the scanner worker exists. */
 const RUNNING_AFTER_MS = 700;
 const GENERATE_AFTER_MS = 2100;
+/**
+ * How long a claimed generation may run before another poller reclaims it. The claim
+ * is deliberately not re-driven — if the isolate that took it died, the audit would
+ * otherwise sit in 'generating' forever and the client would poll against it forever.
+ * Comfortably above the provider's own 15s timeout.
+ */
+const GENERATION_STALE_MS = 45_000;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
 
+/**
+ * IPv6 forms that carry an IPv4 address in their low 32 bits. `new URL()` re-renders
+ * `::ffff:127.0.0.1` as `::ffff:7f00:1`, so the dotted-quad branch never sees them
+ * unless we decode the trailing hex groups back to an address first.
+ */
+const EMBEDDED_IPV4 = /^(?:::ffff:|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
+
+function isBlockedIPv4(host: string) {
+  const parts = host.split(".").map(Number);
+  if (parts.length !== 4 || !parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return false;
+  const [a, b] = parts;
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+}
+
 function isBlockedHostname(hostname: string) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) return true;
-  if (host === "::1" || host === "::" || /^f[cd][0-9a-f]:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host)) return true;
-  const parts = host.split(".").map(Number);
-  if (parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) {
-    const [a, b] = parts;
-    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+  // fc00::/7 unique-local and fe80::/10 link-local. Both prefixes are four hex digits
+  // wide — matching only three silently exempted every ULA address.
+  if (host === "::1" || host === "::" || /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host)) return true;
+
+  const embedded = EMBEDDED_IPV4.exec(host);
+  if (embedded) {
+    const high = parseInt(embedded[1], 16);
+    const low = parseInt(embedded[2], 16);
+    return isBlockedIPv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
   }
-  return false;
+
+  return isBlockedIPv4(host);
 }
 
 async function fingerprint(request: Request) {
@@ -135,6 +161,16 @@ async function handleApi(request: Request, env: Env, url: URL) {
     const progress = (status: AuditStatus) => json({ id: row.id, url: row.submitted_url, status, createdAt, findings: [] });
 
     const elapsed = Date.now() - row.created_at;
+
+    // Reclaim a generation whose isolate never came back, so the audit resolves
+    // instead of stranding the client in an endless poll.
+    if (row.status === "generating" && elapsed > GENERATE_AFTER_MS + GENERATION_STALE_MS) {
+      const message = "The report did not finish generating. Try scanning this page again.";
+      await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ? AND status = 'generating'")
+        .bind("report_generation_stalled", message, Date.now(), row.id).run();
+      return json({ id: row.id, url: row.submitted_url, status: "failed", createdAt, findings: [], error: message });
+    }
+
     if (row.status === "queued" && elapsed > RUNNING_AFTER_MS) {
       await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'").bind(Date.now(), row.id).run();
       row.status = "running";

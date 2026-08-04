@@ -98,6 +98,107 @@ const geminiOk = (body) => new Response(JSON.stringify({ candidates: [{ content:
 
 const fixFor = (findings, ruleId) => findings.find((finding) => finding.ruleId === ruleId).fix;
 
+test("rejects non-public and malformed submission targets", async () => {
+  const rejected = [
+    "not-a-url",
+    "ftp://example.com/page",
+    "file:///etc/passwd",
+    "https://user:secret@example.com/page",
+    "http://localhost:3000/",
+    "http://app.internal/",
+    "http://dev.local/",
+    "http://127.0.0.1/",
+    "http://10.0.0.5/",
+    "http://192.168.1.1/",
+    "http://172.16.4.2/",
+    "http://169.254.169.254/latest/meta-data/", // cloud metadata
+    "http://2130706433/",                       // decimal loopback
+    "http://0177.0.0.1/",                       // octal loopback
+    "http://127.0.0.1./",                       // trailing dot
+    "http://[::1]/",
+    "http://[fe80::1]/",
+    "http://[fc00::1]/",                        // unique-local
+    "http://[::ffff:127.0.0.1]/",               // IPv4-mapped loopback
+    "http://[::ffff:10.0.0.1]/",                // IPv4-mapped private
+    "http://[64:ff9b::127.0.0.1]/",             // NAT64-embedded loopback
+    `https://example.com/${"a".repeat(2100)}`,  // over the length cap
+  ];
+
+  for (const url of rejected) {
+    const env = createEnv();
+    const response = await call(env, "/api/audits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) });
+    assert.equal(response.status, 400, `${url} must be rejected`);
+    assert.equal(env.DB.rows.size, 0, `${url} must not create an audit record`);
+  }
+});
+
+test("accepts ordinary public pages, including public IP literals", async () => {
+  for (const url of ["https://example.com/", "http://example.com/products?q=1", "https://sub.example.co.uk/a/b", "http://93.184.216.34/", "http://[2606:2800:220:1::1]/"]) {
+    const env = createEnv();
+    const response = await call(env, "/api/audits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url }) });
+    assert.equal(response.status, 202, `${url} must be accepted`);
+  }
+});
+
+test("limits anonymous submissions to three per hour per fingerprint", async () => {
+  const env = createEnv();
+  for (let attempt = 0; attempt < 3; attempt += 1) await submit(env);
+
+  const blocked = await call(env, "/api/audits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://shop.example.com/products" }) });
+  assert.equal(blocked.status, 429);
+  assert.equal(env.DB.rows.size, 3, "a rate-limited submission must not be stored");
+
+  // The window is an hour wide, so ageing the existing rows past it frees a slot.
+  for (const row of env.DB.rows.values()) row.created_at = Date.now() - 61 * 60 * 1000;
+  const allowed = await call(env, "/api/audits", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://shop.example.com/products" }) });
+  assert.equal(allowed.status, 202);
+});
+
+test("hides expired audits behind the same 404 as unknown ids", async () => {
+  const env = createEnv();
+  const id = await submit(env);
+
+  env.DB.rows.get(id).expires_at = Date.now() - 1;
+  const expired = await call(env, `/api/audits/${id}`);
+  assert.equal(expired.status, 404);
+
+  const unknown = await call(env, `/api/audits/${crypto.randomUUID()}`);
+  assert.equal(unknown.status, 404);
+  assert.deepEqual(await expired.json(), await unknown.json(), "expiry must not be distinguishable from absence");
+});
+
+test("reclaims a generation whose isolate never returned", async () => {
+  let calls = 0;
+  const restore = stubGemini(async () => { calls += 1; return geminiOk([]); });
+
+  try {
+    const env = createEnv({ GEMINI_API_KEY: "test-key" });
+    const id = await submit(env);
+
+    // Simulate a poller that claimed the transition and then died.
+    env.DB.rows.get(id).status = "generating";
+    env.DB.rows.get(id).created_at = Date.now() - 10 * 60 * 1000;
+
+    const report = await (await call(env, `/api/audits/${id}`)).json();
+    assert.equal(report.status, "failed", "a stranded audit must resolve, not poll forever");
+    assert.match(report.error, /did not finish generating/);
+    assert.equal(env.DB.rows.get(id).status, "failed");
+    assert.equal(calls, 0, "reclaiming must not spend a model request");
+  } finally {
+    restore();
+  }
+});
+
+test("leaves a generation still inside its window alone", async () => {
+  const env = createEnv({ GEMINI_API_KEY: "test-key" });
+  const id = await submit(env);
+  env.DB.rows.get(id).status = "generating";
+
+  const report = await (await call(env, `/api/audits/${id}`)).json();
+  assert.equal(report.status, "generating");
+  assert.equal(env.DB.rows.get(id).status, "generating");
+});
+
 test("completes on deterministic guidance when no Gemini key is configured", async () => {
   const env = createEnv();
   const id = await submit(env);

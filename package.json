@@ -11,7 +11,10 @@
     "start": "vinext start",
     "test": "npm run build && node --test tests/rendered-html.test.mjs tests/fix-provider.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "deploy": "npm run build && wrangler deploy -c dist/server/wrangler.json"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

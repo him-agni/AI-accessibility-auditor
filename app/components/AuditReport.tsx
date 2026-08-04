@@ -22,6 +22,11 @@ const FILTERS = ["all", "critical", "serious", "moderate", "minor"] as const;
 
 const POLL_INTERVAL_MS = 1200;
 const MAX_CONSECUTIVE_ERRORS = 4;
+/**
+ * Wall-clock ceiling. The error counter only catches a failing fetch; an audit stuck
+ * in a non-terminal status answers every poll successfully and would loop forever.
+ */
+const MAX_POLL_MS = 120_000;
 
 export function AuditReport({ auditId }: { auditId: string }) {
   const params = useSearchParams();
@@ -37,6 +42,7 @@ export function AuditReport({ auditId }: { auditId: string }) {
     let attempts = 0;
     let consecutiveErrors = 0;
     let timer: ReturnType<typeof setTimeout>;
+    const startedAt = Date.now();
 
     function fail(message: string) {
       setFailureMessage(message);
@@ -46,6 +52,7 @@ export function AuditReport({ auditId }: { auditId: string }) {
     async function poll() {
       attempts += 1;
       if (attempts > 1) setStatus("running");
+      if (Date.now() - startedAt > MAX_POLL_MS) return fail("This scan did not finish in time. Try scanning this page again.");
       try {
         const response = await fetch(`/api/audits/${auditId}`, { cache: "no-store" });
         const result = await response.json() as Audit;
@@ -84,7 +91,7 @@ export function AuditReport({ auditId }: { auditId: string }) {
       <main className="scan-progress-page">
         <header className="report-nav">
           <Link className="brand" href="/"><span className="brand-mark" aria-hidden="true"><i /><i /><i /></span><span>Clarity</span></Link>
-          <span className="secure-note"><i /> Isolated browser session</span>
+          <span className="secure-note"><i /> Product preview</span>
         </header>
         {status === "failed" ? (
           <section className="progress-card" aria-live="assertive">
@@ -98,15 +105,15 @@ export function AuditReport({ auditId }: { auditId: string }) {
           <section className="progress-card" aria-live="polite">
             <div className="radar" aria-hidden="true"><i /><i /><i /><span /></div>
             <span className="section-kicker">SCAN IN PROGRESS</span>
-            <h1>{status === "queued" ? "Getting the browser ready…" : "Checking the rendered page…"}</h1>
+            <h1>{status === "queued" ? "Preparing your report…" : "Building the report…"}</h1>
             <p className="progress-url">{submittedUrl}</p>
             <div className="progress-steps">
               <span className="done"><i>✓</i> URL validated</span>
-              <span className={status === "running" ? "done" : "active"}><i>{status === "running" ? "✓" : "2"}</i> Browser launched</span>
-              <span className={status === "running" ? "active" : ""}><i>3</i> Running accessibility checks</span>
-              <span><i>4</i> Grouping findings</span>
+              <span className={status === "running" ? "done" : "active"}><i>{status === "running" ? "✓" : "2"}</i> Audit queued</span>
+              <span className={status === "running" ? "active" : ""}><i>3</i> Collecting findings</span>
+              <span><i>4</i> Writing remediations</span>
             </div>
-            <small>Most single-page scans finish in under a minute.</small>
+            <small>Preview reports finish in a few seconds. Real scans will take longer.</small>
           </section>
         )}
       </main>
@@ -134,7 +141,7 @@ export function AuditReport({ auditId }: { auditId: string }) {
         {audit.prototype && (
           <div className="prototype-banner" role="note">
             <span aria-hidden="true">◇</span>
-            <p><b>Interactive product preview</b> — the findings below are representative axe-core results, not a scan of this page, while the isolated browser worker is connected. Remediations are generated from those findings.</p>
+            <p><b>Interactive product preview</b> — the findings below are representative axe-core results, not a scan of this page, until the isolated browser worker is connected. Remediations are generated from those findings.</p>
           </div>
         )}
 

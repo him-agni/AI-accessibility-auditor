@@ -32,17 +32,43 @@ test("server-renders the Clarity scanner landing page", async () => {
 });
 
 test("keeps the finished product free of disposable starter files", async () => {
-  const [page, layout, packageJson, hosting] = await Promise.all([
+  const [page, layout, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
-    readFile(new URL("../.openai/hosting.json", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /<ScanForm \/>/);
   assert.match(layout, /Clarity — AI-assisted accessibility scanner/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
-  assert.match(hosting, /"d1": "DB"/);
   await assert.rejects(access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)));
   await access(new URL("public/og.png", projectRoot));
+
+  // Starter scaffold that shipped with the template and is no longer referenced.
+  for (const removed of ["app/chatgpt-auth.ts", "public/file.svg", "public/globe.svg", "public/window.svg"]) {
+    await assert.rejects(access(new URL(removed, projectRoot)), `${removed} should stay deleted`);
+  }
+});
+
+test("declares its Cloudflare bindings in the config wrangler deploys", async () => {
+  // The Vite plugin and `wrangler deploy` must read the same file, or local dev
+  // and production drift. Comments are legal in .jsonc, so strip them first.
+  const raw = await readFile(new URL("wrangler.jsonc", projectRoot), "utf8");
+  const config = JSON.parse(raw.replace(/^\s*\/\/.*$/gm, ""));
+
+  assert.equal(config.main, "./worker/index.ts");
+  assert.ok(config.compatibility_flags.includes("nodejs_compat"));
+  assert.equal(config.assets.binding, "ASSETS");
+  assert.equal(config.d1_databases[0].binding, "DB");
+  assert.equal(config.d1_databases[0].migrations_dir, "drizzle");
+
+  // A key must never reach the committed config; secrets go through wrangler.
+  assert.doesNotMatch(raw, /GEMINI_API_KEY\s*"?\s*:/);
+  assert.equal(config.vars, undefined);
+
+  // OpenAI Sites hosting has been removed; nothing may reference it again.
+  await assert.rejects(access(new URL(".openai/hosting.json", projectRoot)));
+  await assert.rejects(access(new URL("build/sites-vite-plugin.ts", projectRoot)));
+  const viteConfig = await readFile(new URL("vite.config.ts", projectRoot), "utf8");
+  assert.doesNotMatch(viteConfig, /\.openai|sites-vite-plugin/);
 });
