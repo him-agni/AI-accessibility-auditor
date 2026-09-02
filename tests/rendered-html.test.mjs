@@ -61,6 +61,8 @@ test("declares its Cloudflare bindings in the config wrangler deploys", async ()
   assert.equal(config.assets.binding, "ASSETS");
   assert.equal(config.d1_databases[0].binding, "DB");
   assert.equal(config.d1_databases[0].migrations_dir, "drizzle");
+  // Without this the product cannot scan anything, which is its entire purpose.
+  assert.equal(config.browser.binding, "BROWSER");
 
   // A key must never reach the committed config; secrets go through wrangler.
   assert.doesNotMatch(raw, /GEMINI_API_KEY\s*"?\s*:/);

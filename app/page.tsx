@@ -1,19 +1,16 @@
 import { ScanForm } from "./components/ScanForm";
 import Link from "next/link";
 
-// Written in the future tense on purpose: the isolated browser worker is not
-// connected yet, so the product cannot claim it renders the submitted page today.
-// Move these to the present tense in the same change that ships the real scanner.
 const STEPS = [
   {
     number: "01",
     title: "We render the page",
-    copy: "A fresh desktop browser will open the exact public URL you submit.",
+    copy: "A fresh desktop browser opens the exact public URL you submit.",
   },
   {
     number: "02",
     title: "Axe checks the DOM",
-    copy: "WCAG 2.2 A and AA checks will run against the page state we can see.",
+    copy: "WCAG 2.2 A and AA checks run against the page state we can see.",
   },
   {
     number: "03",
@@ -49,10 +46,6 @@ export default function Home() {
           <span><b aria-hidden="true">✓</b> No account needed</span>
           <span><b aria-hidden="true">✓</b> One page at a time</span>
           <span><b aria-hidden="true">✓</b> Results expire in 7 days</span>
-        </div>
-        <div className="prototype-banner hero-preview-note" role="note">
-          <span aria-hidden="true">◇</span>
-          <p><b>Interactive product preview</b> — submitted pages are not rendered or scanned yet. Reports show representative axe-core findings, clearly labelled, until the isolated browser worker is connected. The fix suggestions are really generated.</p>
         </div>
       </section>
 
@@ -136,7 +129,7 @@ export default function Home() {
         </div>
         <div className="scope-grid">
           <div><b>Checks</b><span>WCAG 2.2 A &amp; AA rules supported by axe-core</span></div>
-          <div><b>Viewport</b><span>Desktop Chromium at 1440 × 900, once scanning is live</span></div>
+          <div><b>Viewport</b><span>Desktop Chromium at 1440 × 900</span></div>
           <div><b>Evidence</b><span>Selectors, HTML snippets, and failure summaries</span></div>
           <div><b>Fixes</b><span>AI-assisted suggestions, clearly marked for review</span></div>
         </div>

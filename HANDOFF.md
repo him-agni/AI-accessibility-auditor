@@ -1,6 +1,6 @@
 # Clarity — Project Handoff
 
-Last updated: August 4, 2026 — audit fixes applied, hosting migrated to Cloudflare Workers
+Last updated: August 28, 2026 — the real scanner is connected; this is no longer a preview
 
 This is the living source of truth for the Clarity accessibility-scanner project. Update it whenever product behavior, architecture, deployment, data, security, or priorities change.
 
@@ -8,11 +8,9 @@ This is the living source of truth for the Clarity accessibility-scanner project
 
 Clarity is a polished, responsive web product that accepts one public webpage URL and presents a grouped accessibility report with evidence, WCAG references, impact levels, and cautious AI-assisted fix examples.
 
-The current hosted release is an **interactive product preview**. It exercises the complete submission, progress, persistence, and report experience, but uses representative axe-core findings. A separate isolated Playwright/Chromium/axe-core worker is still required before results can be described as scans of the submitted page.
+**The product really scans the submitted page.** Cloudflare Browser Rendering opens the URL in a real headless Chromium, axe-core runs against the rendered DOM, and the violations it reports are grouped into the report. Remediations are generated from those real findings by a schema-validated model call behind a provider-neutral interface.
 
-Remediations are no longer preview content: a real schema-validated model call now generates them, behind a provider-neutral interface, from whatever findings the pipeline supplies. The findings are still representative; the fix generation is real.
-
-Do not remove or obscure the in-product preview notice until that production scanner is connected and verified.
+Nothing in the product is representative content any more. The preview notices, the `prototype` response flag, and `lib/findings/representative.ts` were all removed on August 28, 2026 in the same change that connected the scanner. **Do not reintroduce fabricated findings under any circumstance** — if a scan cannot run, the audit fails and says so.
 
 On August 4, 2026 an audit pass fixed several defects and hosting moved from OpenAI Sites to Cloudflare Workers. See "Recent decisions".
 
@@ -20,7 +18,7 @@ On August 4, 2026 an audit pass fixed several defects and hosting moved from Ope
 
 Hosting is **Cloudflare Workers**, deployed with Wrangler. `wrangler.jsonc` at the repository root is the single source of bindings: the Vite plugin and `wrangler deploy` read the same file, so local dev and production cannot drift.
 
-- Bindings: `DB` (D1), `ASSETS` (static assets), `IMAGES` (Cloudflare Images, backs `/_vinext/image` only)
+- Bindings: `DB` (D1), `BROWSER` (Browser Rendering — this is what scans), `ASSETS` (static assets), `IMAGES` (Cloudflare Images, backs `/_vinext/image` only)
 - Deploy: `npm run deploy` — builds, then deploys `dist/server/wrangler.json`, the config Vite emits with bindings resolved
 - Migrations: `npm run db:migrate` (remote) / `npm run db:migrate:local`
 - Secrets: `wrangler secret put GEMINI_API_KEY`; locally, the gitignored `.dev.vars`
@@ -74,7 +72,27 @@ No source credentials, access tokens, bypass tokens, API keys, or other secrets 
 - Persistence: Cloudflare D1
 - Schema management: Drizzle ORM and Drizzle Kit
 - Hosting: Cloudflare Workers via Wrangler (`wrangler.jsonc`)
+- Scanning: Cloudflare Browser Rendering (`@cloudflare/puppeteer`) driving headless Chromium, with `axe-core` injected into the page
 - Fix generation: Google Gemini via the Generative Language REST API, called with plain `fetch` (no SDK) so it runs inside the Worker
+
+### Findings have a kind and a detector
+
+Every finding carries two fields, and the report treats them as load-bearing:
+
+- `kind` — `violation` (maps to a WCAG 2.x A/AA success criterion) or `advisory` (axe best-practice; good hygiene, not a failure). **Only violations count toward the headline totals or the impact filters.** Advisories render in a separate, visually subordinate section that states plainly that they are not WCAG failures.
+- `detector` — `axe` today. `heuristic` (our own browser-driven checks) and `ai` (model-suggested, never asserted as measured fact) are the planned additions, and the report must keep them distinguishable from what axe actually measured.
+
+This split is the thing that makes it safe to add non-axe checks later. Without it, a heuristic guess and an axe measurement would look identical in the report, which is the failure mode this product exists to avoid. Do not collapse these fields, and do not let an advisory or a future AI suggestion into the headline numbers.
+
+axe runs with `best-practice` alongside the WCAG tags, so all 105 of its rules execute; `normalize` splits them by tag. Group counts are capped per kind (25 violations, 15 advisories) so a flood of advisories can never push a real failure out of the report.
+
+Advisories deliberately **do not go to the model**. They are lower stakes and more numerous, and including them would grow the prompt without changing what a team fixes first, so they always take deterministic guidance. An audit therefore stays at exactly one model request no matter how many best-practice notes a page produces.
+
+### How a scan runs
+
+`POST /api/audits` validates the URL, stores a `queued` row, answers `202`, and starts the job with `ctx.waitUntil` — so the submission returns immediately and the client polls a real job rather than a timer. The job walks `queued → running → generating → completed`, or to `failed` with a stable `error_code`. Because the job lives in `waitUntil`, nothing re-drives it if that isolate is evicted; a reader retires any audit still non-terminal after `JOB_STALE_MS` (150s).
+
+axe-core is bundled as a string (`axe-core/axe.min.js?raw`) and injected into the page. It never executes inside the Worker — only in the isolated browser tab.
 
 **There is no OpenAI dependency of any kind.** Gemini is the only model provider, and no `openai` package has ever been installed. The `.openai/` directory that used to sit at the root was OpenAI *Sites hosting* configuration, unrelated to models; it was removed on August 4 along with `build/sites-vite-plugin.ts` when hosting moved to Cloudflare Workers.
 
@@ -91,11 +109,13 @@ Important files:
 - `lib/fixes/index.ts` — provider selection and per-group fallback; the only entry point callers need
 - `lib/fixes/gemini.ts` — Gemini request, response schema, output validation, injection guard
 - `lib/fixes/deterministic.ts` — axe/WCAG guidance used when no model is configured or a call fails
-- `lib/findings/representative.ts` — the single source of preview findings
+- `lib/scan/index.ts` — the browser scan: navigation, request interception, redirect revalidation, axe injection, timeouts
+- `lib/scan/normalize.ts` — axe violations mapped onto the report shape, with all the bounds
 - `db/schema.ts` — normalized audit, issue-group, occurrence, and fix-suggestion models
 - `drizzle/` — generated D1 migrations packaged for hosting
-- `tests/rendered-html.test.mjs` — rendered-product smoke tests
-- `tests/fix-provider.test.mjs` — fix-generation behavior against the built Worker bundle
+- `tests/rendered-html.test.mjs` — rendered-product smoke tests and deploy-config assertions
+- `tests/fix-provider.test.mjs` — HTTP contract against the built Worker bundle, plus fix-provider behaviour
+- `tests/normalize.test.mjs` — the axe-to-report mapping
 - `public/og.png` — generated social preview card
 
 Removed on August 4 as unused scaffold: `app/chatgpt-auth.ts`, `public/file.svg`, `public/globe.svg`, `public/window.svg`. A test now asserts they stay deleted. Note that `app/chatgpt-auth.ts` was the only thing that could have gated access by ChatGPT identity — see the access-control note under "Hosting".
@@ -174,19 +194,30 @@ The browser worker must treat the page, markup, resource URLs, redirects, and mo
 
 ## Validation status
 
-Re-run on August 4, 2026 after the cleanups and the hosting migration:
+Re-run on August 28, 2026 after connecting the scanner:
 
 | Gate | Command | Result |
 | --- | --- | --- |
 | Production build | `npm run build` | pass — 5/5 environments |
 | Type check | `npx tsc --noEmit` | pass — no errors |
 | Lint | `npm run lint` | pass — no warnings |
-| Tests | `npm test` | pass — 17/17 (was 10) |
+| Tests | `npm test` | pass — 33/33 (was 27) |
 | Deploy config | `npm run deploy -- --dry-run` | pass — resolves `DB`, `IMAGES`, `ASSETS` |
 
-Coverage now spans fix generation (no-key fallback, one-request-per-audit, provenance, always-manual-review rules, per-group degradation, HTTP/timeout/network failure, fence stripping, single-poller claiming, stored-report replay) and, new on August 4, the worker controls this document describes as security features: the URL guard across 22 rejected and 5 accepted targets, the three-per-hour rate limit including window expiry, the seven-day expiry read filter, and both sides of the stranded-`generating` sweep. Plus the rendered-product smoke tests and a check that `wrangler.jsonc` declares the bindings and carries no key.
+**Live scans verified against real pages** through `wrangler dev`, which runs a real local Chromium:
 
-A real deploy has not been performed — it needs the D1 database id. Browser screenshot and visual-regression testing were not requested and are not release gates.
+| Page | Outcome |
+| --- | --- |
+| `news.ycombinator.com` | 5 violations — `image-alt` ×3, `label` ×1, `color-contrast` ×238, `target-size` ×29, `link-name` ×1 — plus 3 advisories (`landmark-one-main`, `page-has-heading-one`, `region`), with real selectors and markup |
+| `example.com` | completed, 0 findings — genuinely clean, title "Example Domain" read from the live DOM |
+| `wikipedia.org` | completed, 0 findings |
+| `w3.org/WAI/demos/bad/…` | failed with "The page returned HTTP 403" — the site blocked the request, reported honestly |
+
+`target-size` appearing confirms the WCAG 2.2 AA tag set is active. The three-per-hour rate limit fired mid-testing, which was its own confirmation.
+
+Coverage spans the HTTP contract (URL guard across 22 rejected and 5 accepted targets, rate limit including window expiry, expiry filter, staleness sweep, stored-report replay, and that a missing browser binding fails rather than fabricates), the axe-to-report mapping (bounds, ordering, WCAG tag derivation, malformed input, `javascript:` href rejection), and fix generation (no-key fallback, one-request-per-audit, provenance, always-manual-review rules, per-group degradation, HTTP/timeout/network failure, fence stripping).
+
+Not yet verified: a real deploy, and the remote Browser Rendering service. Browser screenshot and visual-regression testing were not requested and are not release gates.
 
 ## Honesty gaps — closed August 4, 2026
 
@@ -198,30 +229,42 @@ Clarity's central product claim is that it never overstates what it did. Three p
 
 ## Known limitations
 
-1. Submitted pages are not yet rendered by Playwright or scanned with axe-core.
-2. Report findings are representative and intentionally labeled as a preview. Remediations generated from them are real, which means real model output about a page that was never visited — the preview notice carries this and must stay.
-3. The Gemini path has not been exercised against the live API; it is verified only against a stubbed endpoint. Confirm with a real key before relying on it.
-4. DNS rebinding and subresource protections require the isolated worker boundary.
-5. No queue or retry dashboard yet. Worker observability is now enabled in `wrangler.jsonc`.
-6. No scheduled cleanup physically deletes expired audits. A Workers cron trigger is the natural home for this.
-7. **There is no access control on the deployment.** The ChatGPT sign-in gate went away with OpenAI Sites. Put Cloudflare Access in front of the Worker before attaching a public domain, if it should stay private.
-8. The product intentionally excludes crawling, authentication, mobile viewports, screenshots, keyboard simulation, screen-reader testing, histories, billing, and automated code changes.
-
-Fixed on August 4, previously listed here: an audit stranded in `generating` polled forever. The completion transition is claimed with a conditional `UPDATE`, and if the isolate died mid-generation nothing re-drove it; the client capped only *consecutive network errors*, so a well-formed `generating` response looped indefinitely. There is now a server-side sweep that reclaims a claim older than `GENERATION_STALE_MS` (45s past the generation point) and fails the audit, plus a `MAX_POLL_MS` wall-clock ceiling on the client. Both directions are tested. The sweep reuses `created_at` rather than adding a `generating_at` column, so no migration was needed; if the preview pacing constants change, re-check that arithmetic.
+1. **The scan has not been exercised against the deployed Browser Rendering service** — only against the local Chromium `wrangler dev` provides. Remote behaviour (cold starts, session acquisition, concurrency limits) is unverified. Confirm after the first deploy.
+2. The Gemini path has not been exercised against the live API; it is verified only against a stubbed endpoint. Confirm with a real key before relying on it.
+3. **DNS rebinding is not addressed.** Every request the page makes is re-validated by hostname (`page.on("request")`), and the landed URL is re-checked after redirects, but a hostname that resolves to a private address still passes — the guard never sees resolved IPs. Cloudflare's browser runs outside our network, which limits the blast radius, but this is the remaining gap in the URL-guard story.
+4. Only one page state is scanned: no interaction, no scrolling, no dismissing of cookie banners. A page that renders its real content only after consent will be scanned in its pre-consent state.
+5. Some sites block automated browsers outright. The scan surfaces that as an honest `http_error` (a 403 from `w3.org` was seen during testing) rather than an empty report.
+6. No queue or retry dashboard yet. Worker observability is enabled in `wrangler.jsonc`.
+7. No scheduled cleanup physically deletes expired audits. A Workers cron trigger is the natural home for this.
+8. **There is no access control on the deployment.** The ChatGPT sign-in gate went away with OpenAI Sites. Put Cloudflare Access in front of the Worker before attaching a public domain, if it should stay private.
+9. Browser Rendering has a free-tier ceiling of 10 minutes of browser time per day and 3 concurrent browsers. At roughly 5–15s per scan that is comfortably above the three-per-hour submission limit, but it is a real ceiling — a busy day returns `browser_unavailable` failures, not fake results.
+10. The product intentionally excludes crawling, authentication, mobile viewports, screenshots, keyboard simulation, screen-reader testing, histories, billing, and automated code changes.
 
 ## Recommended next build
 
 Finish the hosting cutover first — it is four commands, listed under "Hosting": create the D1 database, paste its id into `wrangler.jsonc`, run the migrations, set the Gemini secret. Then decide on Cloudflare Access before attaching a domain.
 
-Then the real scanner vertical slice, unchanged:
+The scanner milestone is done. What is left of it, and what came next:
 
-1. Create a separately deployable Node worker with Playwright, Chromium, and axe-core.
-2. Add public-destination validation that covers DNS, redirects, and subresources.
-3. Connect the web submission API to a queue instead of preview completion timing.
-4. Normalize axe results into `issue_groups` and `occurrences`.
-5. Return those persisted results through the existing report API shape.
-6. Replace the preview banner only after fixture and security tests pass.
-7. ~~Add one schema-validated fix-generator provider behind a provider-neutral interface.~~ Done, August 3, 2026 — `lib/fixes` with a Gemini implementation. Point it at real axe output; no interface change needed.
+1. ~~Create a separately deployable Node worker with Playwright, Chromium, and axe-core.~~ Superseded, August 28, 2026 — Cloudflare Browser Rendering gives a real Chromium inside the existing Worker, so there is no second service, no queue, and no sandboxing for us to own.
+2. ~~Add public-destination validation that covers redirects and subresources.~~ Done — `page.on("request")` re-validates every request, and the landed URL is re-checked after redirects. **DNS resolution checks are still missing**; see limitation 3.
+3. ~~Return persisted results through the existing report API shape.~~ Done.
+4. ~~Replace the preview banner.~~ Done — the banner, the `prototype` flag, and the representative findings module are all gone.
+5. ~~Add one schema-validated fix-generator provider behind a provider-neutral interface.~~ Done, August 3, 2026.
+6. ~~Run axe's full rule set behind a violation/advisory split.~~ Done, September 2, 2026.
+7. **Still open:** normalize results into `issue_groups` and `occurrences` rather than `report_json`. The tables and their migration exist and are unused.
+8. **Still open:** a scheduled cleanup that physically deletes expired audits.
+
+### Comprehensiveness roadmap
+
+Agreed order for widening what the auditor detects. The `kind`/`detector` split above is the enabling change and is done, so each of these can land independently:
+
+1. **Keyboard and focus walk** (`detector: heuristic`) — press Tab through the page in the real browser and record `document.activeElement` and its box at each step. Catches genuine keyboard traps, focus on invisible elements, jarring visual order, and missing focus indicators. Deterministic, no model, and it covers the largest category axe structurally cannot reach. Highest value; note it changes the "no keyboard simulation" scope decision below.
+2. **Second viewport (390px) and 200% zoom** — re-run axe after `setViewport`. Unlocks reflow (1.4.10) and changes `target-size` entirely. Nearly free.
+3. **Fake interactive elements** (`detector: heuristic`) — an element with a click listener but no role, no tabindex, and `cursor: pointer` is a button that assistive technology cannot see. Detect via CDP `DOMDebugger.getEventListeners`; the model only writes the suggested label.
+4. **Static form-error plumbing** — `aria-describedby` wiring, `aria-live` regions, `aria-invalid`. **Do not submit forms on third-party sites** to observe dynamic errors: that can create accounts, send messages, or trigger purchases on pages we do not own. Static checks only.
+5. **Accessible authentication (SC 3.3.8)** — paste blocked on password fields, missing `autocomplete="username"`/`"current-password"`, CAPTCHA present. Narrow, only fires on login pages, but nothing else reports it.
+6. **Vision alt-text review** (`detector: ai`) — last, behind a flag. Judging whether alt text is *meaningful* is the biggest quality gap, but it breaks the one-request-per-audit budget, and `image-alt` is deliberately always-manual-review because alt quality is human judgement. Ship as suggestions in the advisory tier, never as violations.
 
 ## Product decisions to preserve
 
@@ -258,3 +301,8 @@ For every future change:
 - August 4, 2026 — Fixed all of the above and covered each with a test. Suite went from 10 to 17. The URL guard, rate limit, and expiry filter now have coverage; their absence is why the guard defects went unnoticed for as long as they did.
 - August 4, 2026 — Migrated hosting from OpenAI Sites to Cloudflare Workers. Removed `.openai/hosting.json`, `build/sites-vite-plugin.ts`, and the dead `app/chatgpt-auth.ts` scaffold; added `wrangler.jsonc` as the single source of bindings for both the Vite plugin and `wrangler deploy`. Chose one root config over separate dev and deploy configs specifically so the two cannot drift. Two consequences to keep visible: the `chatgpt.site` URL is gone, and with it the only access gate the product had.
 - August 4, 2026 — Recorded explicitly that Gemini is the sole model provider and that no OpenAI dependency has ever existed. The `.openai/` directory was hosting configuration, not a model provider, and its name caused exactly the confusion the note now prevents.
+- August 28, 2026 — **Connected the real scanner.** Chose Cloudflare Browser Rendering over the separately deployed Playwright service this document had specified since August 2. The original plan predated knowing that Browser Rendering gives a real Chromium inside the existing Worker: it removes a second deploy target, a queue, and the entire non-root-sandboxing and egress-restriction burden, all of which Cloudflare now owns. It also runs locally under `wrangler dev`, so the scanner is testable without an account.
+- August 28, 2026 — Moved the audit job to `ctx.waitUntil` from the submission request, replacing the timer that faked progress. The client now polls a real job and mirrors its actual status. Deleted the preview notices, the `prototype` response flag, and `lib/findings/representative.ts` in the same change — representative findings had no remaining purpose, and leaving them would have left a path back to fabricated reports.
+- August 28, 2026 — Kept "no browser binding" as a hard failure rather than a fallback to example data. This is the same decision as August 3's removal of the client-side fallback, and it is the one the product's central claim rests on.
+- September 2, 2026 — Turned on axe's 30 `best-practice` rules, taking the scanner from 70 of 105 rules to all 105. Verified on `news.ycombinator.com`: three findings we had been blind to (`landmark-one-main`, `page-has-heading-one`, `region`) with the headline count unchanged.
+- September 2, 2026 — Added `kind` and `detector` to every finding, and split the report into WCAG failures and advisory notes. Chose two fields over one because they are independent axes: a future heuristic check for keyboard traps would be `detector: heuristic` *and* `kind: violation` (WCAG 2.1.2), so collapsing them would force a wrong answer. Advisories are excluded from all headline numbers and from the model prompt.

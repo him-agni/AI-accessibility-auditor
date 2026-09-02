@@ -15,8 +15,10 @@ type Audit = {
   completedAt?: string;
   findings: Finding[];
   error?: string;
-  prototype?: boolean;
 };
+
+/** The non-terminal states the progress card renders, plus the local failure state. */
+type Progress = "queued" | "running" | "generating" | "failed";
 
 const FILTERS = ["all", "critical", "serious", "moderate", "minor"] as const;
 
@@ -25,21 +27,21 @@ const MAX_CONSECUTIVE_ERRORS = 4;
 /**
  * Wall-clock ceiling. The error counter only catches a failing fetch; an audit stuck
  * in a non-terminal status answers every poll successfully and would loop forever.
+ * Above the worker's own 150s staleness sweep, so the server normally resolves first.
  */
-const MAX_POLL_MS = 120_000;
+const MAX_POLL_MS = 180_000;
 
 export function AuditReport({ auditId }: { auditId: string }) {
   const params = useSearchParams();
-  const submittedUrl = params.get("url") || "https://shop.example.com/products";
+  const submittedUrl = params.get("url") || "";
   const [audit, setAudit] = useState<Audit | null>(null);
-  const [status, setStatus] = useState<"queued" | "running" | "failed">("queued");
+  const [status, setStatus] = useState<Progress>("queued");
   const [failureMessage, setFailureMessage] = useState("");
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>("all");
   const [copied, setCopied] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let attempts = 0;
     let consecutiveErrors = 0;
     let timer: ReturnType<typeof setTimeout>;
     const startedAt = Date.now();
@@ -50,8 +52,6 @@ export function AuditReport({ auditId }: { auditId: string }) {
     }
 
     async function poll() {
-      attempts += 1;
-      if (attempts > 1) setStatus("running");
       if (Date.now() - startedAt > MAX_POLL_MS) return fail("This scan did not finish in time. Try scanning this page again.");
       try {
         const response = await fetch(`/api/audits/${auditId}`, { cache: "no-store" });
@@ -61,7 +61,11 @@ export function AuditReport({ auditId }: { auditId: string }) {
         consecutiveErrors = 0;
         if (result.status === "completed") setAudit(result);
         else if (result.status === "failed") fail(result.error || "This page could not be scanned.");
-        else timer = setTimeout(poll, POLL_INTERVAL_MS);
+        else {
+          // Mirror the job's real status rather than guessing from attempt count.
+          setStatus(result.status);
+          timer = setTimeout(poll, POLL_INTERVAL_MS);
+        }
       } catch {
         if (cancelled) return;
         // Transient network trouble is worth retrying; a persistent outage is not
@@ -76,9 +80,13 @@ export function AuditReport({ auditId }: { auditId: string }) {
     return () => { cancelled = true; clearTimeout(timer); };
   }, [auditId]);
 
-  const visibleFindings = useMemo(() => audit?.findings.filter((finding) => filter === "all" || finding.impact === filter) || [], [audit, filter]);
-  const totalElements = audit?.findings.reduce((sum, finding) => sum + finding.count, 0) || 0;
-  const impactCounts = audit?.findings.reduce<Record<string, number>>((acc, finding) => ({ ...acc, [finding.impact]: (acc[finding.impact] || 0) + 1 }), {}) || {};
+  // Advisories are good practice, not WCAG failures. They are reported separately
+  // and deliberately excluded from every headline number.
+  const violations = useMemo(() => audit?.findings.filter((finding) => finding.kind !== "advisory") || [], [audit]);
+  const advisories = useMemo(() => audit?.findings.filter((finding) => finding.kind === "advisory") || [], [audit]);
+  const visibleFindings = useMemo(() => violations.filter((finding) => filter === "all" || finding.impact === filter), [violations, filter]);
+  const totalElements = violations.reduce((sum, finding) => sum + finding.count, 0);
+  const impactCounts = violations.reduce<Record<string, number>>((acc, finding) => ({ ...acc, [finding.impact]: (acc[finding.impact] || 0) + 1 }), {});
 
   async function copyCode(key: string, code: string) {
     await navigator.clipboard.writeText(code);
@@ -86,12 +94,59 @@ export function AuditReport({ auditId }: { auditId: string }) {
     setTimeout(() => setCopied(null), 1500);
   }
 
+  /** One rule group. Shared by the violations list and the advisory list. */
+  function renderFinding(finding: Finding, openByDefault: boolean) {
+    const advisory = finding.kind === "advisory";
+    return (
+      <details className={`finding-card impact-${finding.impact}${advisory ? " advisory-card" : ""}`} key={finding.ruleId} open={openByDefault}>
+        <summary>
+          <span className={`severity-symbol ${advisory ? "advisory-bg" : `${finding.impact}-bg`}`}>{advisory ? "i" : "!"}</span>
+          <span className="finding-title"><b>{finding.title}</b><small>{finding.count} affected {finding.count === 1 ? "element" : "elements"} · {finding.ruleId}</small></span>
+          <span className={`impact ${advisory ? "advisory-text" : `${finding.impact}-text`}`}>{advisory ? "advisory" : finding.impact}</span>
+          <span className="chevron" aria-hidden="true">⌄</span>
+        </summary>
+        <div className="finding-detail">
+          <div className="finding-explanation">
+            <p>{finding.explanation}</p>
+            {finding.wcag.length > 0 && (
+              <div className="wcag-links"><span>{advisory ? "Reference" : "WCAG references"}</span>{finding.wcag.map((item) => <a key={item.label} href={item.href} target="_blank" rel="noreferrer">{item.label} ↗</a>)}</div>
+            )}
+          </div>
+
+          <div className="occurrences-block">
+            <div className="subheading"><h3>Evidence</h3><span>Showing {finding.occurrences.length} of {finding.count}</span></div>
+            {finding.occurrences.map((occurrence, occurrenceIndex) => {
+              const key = `${finding.ruleId}-${occurrenceIndex}`;
+              return (
+                <div className="occurrence" key={occurrence.selector}>
+                  <div className="occurrence-top"><span>Element {occurrenceIndex + 1}</span><code>{occurrence.selector}</code></div>
+                  <div className="code-block"><code>{occurrence.html}</code><button aria-label="Copy HTML snippet" onClick={() => copyCode(key, occurrence.html)}>{copied === key ? "Copied" : "Copy"}</button></div>
+                  <p><b>{advisory ? "What axe reported:" : "Why it failed:"}</b> {occurrence.failure}</p>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="ai-fix">
+            <div className="ai-fix-head"><span className="ai-badge"><i>✦</i> {finding.fix.provider && finding.fix.provider !== "deterministic" ? "AI-assisted fix" : "Standard guidance"}</span><span className={`confidence confidence-${finding.fix.confidence}`}>{finding.fix.confidence} confidence</span></div>
+            <h3>{finding.fix.summary}</h3>
+            <p>{finding.fix.whyItMatters}</p>
+            <ol>{finding.fix.steps.map((step) => <li key={step}>{step}</li>)}</ol>
+            {finding.fix.codeExample && <div className="fix-code"><div><span>Suggested example</span><span>HTML / CSS</span></div><pre><code>{finding.fix.codeExample}</code></pre><button onClick={() => copyCode(`${finding.ruleId}-fix`, finding.fix.codeExample || "")}>{copied === `${finding.ruleId}-fix` ? "Copied" : "Copy example"}</button></div>}
+            {finding.fix.requiresManualReview && <div className="review-note"><span aria-hidden="true">!</span><p><b>Manual review required.</b> Confirm this fix matches the element’s purpose and test it with assistive technology.</p></div>}
+            {finding.fix.model && <p className="fix-provenance">{finding.fix.provider === "deterministic" ? "Deterministic axe and WCAG guidance — no model was used." : `Generated by ${finding.fix.model}. Always review before shipping.`}</p>}
+          </div>
+        </div>
+      </details>
+    );
+  }
+
   if (!audit) {
     return (
       <main className="scan-progress-page">
         <header className="report-nav">
           <Link className="brand" href="/"><span className="brand-mark" aria-hidden="true"><i /><i /><i /></span><span>Clarity</span></Link>
-          <span className="secure-note"><i /> Product preview</span>
+          <span className="secure-note"><i /> Isolated browser session</span>
         </header>
         {status === "failed" ? (
           <section className="progress-card" aria-live="assertive">
@@ -105,15 +160,15 @@ export function AuditReport({ auditId }: { auditId: string }) {
           <section className="progress-card" aria-live="polite">
             <div className="radar" aria-hidden="true"><i /><i /><i /><span /></div>
             <span className="section-kicker">SCAN IN PROGRESS</span>
-            <h1>{status === "queued" ? "Preparing your report…" : "Building the report…"}</h1>
+            <h1>{status === "queued" ? "Getting the browser ready…" : status === "running" ? "Checking the rendered page…" : "Writing the remediations…"}</h1>
             <p className="progress-url">{submittedUrl}</p>
             <div className="progress-steps">
               <span className="done"><i>✓</i> URL validated</span>
-              <span className={status === "running" ? "done" : "active"}><i>{status === "running" ? "✓" : "2"}</i> Audit queued</span>
-              <span className={status === "running" ? "active" : ""}><i>3</i> Collecting findings</span>
-              <span><i>4</i> Writing remediations</span>
+              <span className={status === "queued" ? "active" : "done"}><i>{status === "queued" ? "2" : "✓"}</i> Browser launched</span>
+              <span className={status === "running" ? "active" : status === "generating" ? "done" : ""}><i>{status === "generating" ? "✓" : "3"}</i> Running accessibility checks</span>
+              <span className={status === "generating" ? "active" : ""}><i>4</i> Grouping findings and writing fixes</span>
             </div>
-            <small>Preview reports finish in a few seconds. Real scans will take longer.</small>
+            <small>Most single-page scans finish in well under a minute.</small>
           </section>
         )}
       </main>
@@ -138,15 +193,8 @@ export function AuditReport({ auditId }: { auditId: string }) {
           <div className="report-actions"><button onClick={() => window.print()}>Print report</button><Link href="/">Scan another page <span aria-hidden="true">→</span></Link></div>
         </section>
 
-        {audit.prototype && (
-          <div className="prototype-banner" role="note">
-            <span aria-hidden="true">◇</span>
-            <p><b>Interactive product preview</b> — the findings below are representative axe-core results, not a scan of this page, until the isolated browser worker is connected. Remediations are generated from those findings.</p>
-          </div>
-        )}
-
         <section className="report-summary" aria-label="Scan summary">
-          <div className="summary-count"><strong>{audit.findings.length}</strong><span>Affected<br />rules</span></div>
+          <div className="summary-count"><strong>{violations.length}</strong><span>Affected<br />rules</span></div>
           <div className="summary-count"><strong>{totalElements}</strong><span>Affected<br />elements</span></div>
           <div className="summary-severities">
             {(["critical", "serious", "moderate"] as Impact[]).map((impact) => (
@@ -158,56 +206,43 @@ export function AuditReport({ auditId }: { auditId: string }) {
 
         <section className="report-content">
           <div className="findings-header">
-            <div><span className="section-kicker">DETECTABLE ISSUES</span><h2>Findings</h2></div>
+            <div><span className="section-kicker">WCAG 2.2 A / AA FAILURES</span><h2>Findings</h2></div>
             <div className="filters" aria-label="Filter by impact">
-              {FILTERS.map((item) => <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item === "all" ? `All ${audit.findings.length}` : item}</button>)}
+              {FILTERS.map((item) => <button key={item} className={filter === item ? "active" : ""} onClick={() => setFilter(item)}>{item === "all" ? `All ${violations.length}` : item}</button>)}
             </div>
           </div>
 
           <div className="findings-stack">
-            {visibleFindings.map((finding, index) => (
-              <details className={`finding-card impact-${finding.impact}`} key={finding.ruleId} open={index === 0 && filter === "all"}>
-                <summary>
-                  <span className={`severity-symbol ${finding.impact}-bg`}>!</span>
-                  <span className="finding-title"><b>{finding.title}</b><small>{finding.count} affected {finding.count === 1 ? "element" : "elements"} · {finding.ruleId}</small></span>
-                  <span className={`impact ${finding.impact}-text`}>{finding.impact}</span>
-                  <span className="chevron" aria-hidden="true">⌄</span>
-                </summary>
-                <div className="finding-detail">
-                  <div className="finding-explanation">
-                    <p>{finding.explanation}</p>
-                    <div className="wcag-links"><span>WCAG references</span>{finding.wcag.map((item) => <a key={item.label} href={item.href} target="_blank" rel="noreferrer">{item.label} ↗</a>)}</div>
-                  </div>
-
-                  <div className="occurrences-block">
-                    <div className="subheading"><h3>Evidence</h3><span>Showing {finding.occurrences.length} of {finding.count}</span></div>
-                    {finding.occurrences.map((occurrence, occurrenceIndex) => {
-                      const key = `${finding.ruleId}-${occurrenceIndex}`;
-                      return (
-                        <div className="occurrence" key={occurrence.selector}>
-                          <div className="occurrence-top"><span>Element {occurrenceIndex + 1}</span><code>{occurrence.selector}</code></div>
-                          <div className="code-block"><code>{occurrence.html}</code><button aria-label="Copy HTML snippet" onClick={() => copyCode(key, occurrence.html)}>{copied === key ? "Copied" : "Copy"}</button></div>
-                          <p><b>Why it failed:</b> {occurrence.failure}</p>
-                        </div>
-                      );
-                    })}
-                  </div>
-
-                  <div className="ai-fix">
-                    <div className="ai-fix-head"><span className="ai-badge"><i>✦</i> {finding.fix.provider && finding.fix.provider !== "deterministic" ? "AI-assisted fix" : "Standard guidance"}</span><span className={`confidence confidence-${finding.fix.confidence}`}>{finding.fix.confidence} confidence</span></div>
-                    <h3>{finding.fix.summary}</h3>
-                    <p>{finding.fix.whyItMatters}</p>
-                    <ol>{finding.fix.steps.map((step) => <li key={step}>{step}</li>)}</ol>
-                    {finding.fix.codeExample && <div className="fix-code"><div><span>Suggested example</span><span>HTML / CSS</span></div><pre><code>{finding.fix.codeExample}</code></pre><button onClick={() => copyCode(`${finding.ruleId}-fix`, finding.fix.codeExample || "")}>{copied === `${finding.ruleId}-fix` ? "Copied" : "Copy example"}</button></div>}
-                    {finding.fix.requiresManualReview && <div className="review-note"><span aria-hidden="true">!</span><p><b>Manual review required.</b> Confirm this fix matches the element’s purpose and test it with assistive technology.</p></div>}
-                    {finding.fix.model && <p className="fix-provenance">{finding.fix.provider === "deterministic" ? "Deterministic axe and WCAG guidance — no model was used." : `Generated by ${finding.fix.model}. Always review before shipping.`}</p>}
-                  </div>
-                </div>
-              </details>
-            ))}
-            {visibleFindings.length === 0 && <div className="empty-filter"><b>No {filter} findings</b><span>Try another impact filter.</span></div>}
+            {visibleFindings.map((finding, index) => renderFinding(finding, index === 0 && filter === "all"))}
+            {visibleFindings.length === 0 && (
+              violations.length === 0
+                // A genuinely clean scan is a real outcome now, not an empty filter.
+                ? <div className="empty-filter clean-result"><b>No WCAG failures detected</b><span>axe-core found no WCAG 2.2 A or AA violations it can detect automatically on this page. That is not the same as being accessible — keyboard and assistive-technology testing are still required.{advisories.length > 0 ? ` ${advisories.length} best-practice ${advisories.length === 1 ? "note is" : "notes are"} listed below.` : ""}</span></div>
+                : <div className="empty-filter"><b>No {filter} findings</b><span>Try another impact filter.</span></div>
+            )}
           </div>
         </section>
+
+        {advisories.length > 0 && (
+          <section className="report-content advisory-section">
+            <div className="findings-header">
+              <div>
+                <span className="section-kicker">BEST PRACTICE</span>
+                <h2>Advisory notes</h2>
+              </div>
+              <span className="advisory-count">{advisories.length}</span>
+            </div>
+            <p className="advisory-lead">
+              These are <b>not WCAG failures</b> and are excluded from the counts above. They are
+              patterns that commonly cause problems for assistive technology — missing landmarks,
+              skipped heading levels, positive <code>tabindex</code> — and are usually worth fixing
+              once the failures above are resolved.
+            </p>
+            <div className="findings-stack">
+              {advisories.map((finding) => renderFinding(finding, false))}
+            </div>
+          </section>
+        )}
 
         <section className="report-disclaimer">
           <span aria-hidden="true">◎</span><div><b>This is an automated first pass.</b><p>This scan identifies detectable issues in one rendered desktop page state. It is not a WCAG compliance certification and does not replace manual testing.</p></div>

@@ -28,6 +28,13 @@
     "binding": "IMAGES"
   },
 
+  // Browser Rendering. This is what actually scans the submitted page — without it
+  // the API reports scanning as unavailable rather than inventing findings.
+  // `wrangler dev` runs a real Chromium locally; no account needed to test.
+  "browser": {
+    "binding": "BROWSER"
+  },
+
   "observability": {
     "enabled": true
   }

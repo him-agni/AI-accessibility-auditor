@@ -9,7 +9,8 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test": "npm run build && node --test tests/rendered-html.test.mjs tests/fix-provider.test.mjs",
+    "test:build": "esbuild lib/fixes/index.ts lib/scan/normalize.ts --bundle --format=esm --platform=neutral --outdir=dist/test --out-extension:.js=.mjs",
+    "test": "npm run build && npm run test:build && node --test tests/rendered-html.test.mjs tests/fix-provider.test.mjs tests/normalize.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "wrangler d1 migrations apply DB --remote",
@@ -17,12 +18,14 @@
     "deploy": "npm run build && wrangler deploy -c dist/server/wrangler.json"
   },
   "dependencies": {
+    "axe-core": "4.13.0",
     "drizzle-orm": "0.45.2",
     "next": "16.2.6",
     "react": "19.2.6",
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "1.4.0",
     "@cloudflare/vite-plugin": "1.37.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",

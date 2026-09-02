@@ -1,12 +1,14 @@
-/** Cloudflare Worker entry point for the Clarity product preview. */
+/** Cloudflare Worker entry point for Clarity. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
 import { buildFindings } from "../lib/fixes";
-import { representativeFindings } from "../lib/findings/representative";
+import { scanPage, ScanError, type BrowserBinding } from "../lib/scan";
 
 interface Env {
   ASSETS: Fetcher;
   DB: D1Database;
+  /** Browser Rendering binding. Absent means scanning is unavailable, not that results are faked. */
+  BROWSER?: BrowserBinding;
   /** Google AI Studio key. Absent is valid: reports fall back to deterministic guidance. */
   GEMINI_API_KEY?: string;
   /** Optional free-tier model override, e.g. "gemini-2.0-flash". */
@@ -63,16 +65,13 @@ const SCHEMA = [
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 
-/** Preview pacing. Replace both with real queue events once the scanner worker exists. */
-const RUNNING_AFTER_MS = 700;
-const GENERATE_AFTER_MS = 2100;
 /**
- * How long a claimed generation may run before another poller reclaims it. The claim
- * is deliberately not re-driven — if the isolate that took it died, the audit would
- * otherwise sit in 'generating' forever and the client would poll against it forever.
- * Comfortably above the provider's own 15s timeout.
+ * How long an audit may sit in a non-terminal status before a reader declares it
+ * dead. The job runs in `waitUntil`, so nothing re-drives it if that isolate is
+ * evicted; without this an abandoned audit would poll forever. Comfortably above
+ * the scanner's own 55s ceiling plus the fix provider's 15s.
  */
-const GENERATION_STALE_MS = 45_000;
+const JOB_STALE_MS = 150_000;
 
 function json(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
@@ -126,7 +125,47 @@ function ensureDatabase(db: D1Database) {
   return schemaReady;
 }
 
-async function handleApi(request: Request, env: Env, url: URL) {
+/**
+ * The audit job: render, scan, then write remediations. Runs in `waitUntil` after the
+ * submission has already been answered, so the client polls a real job rather than a
+ * timer. Never throws — every exit writes a terminal status, or the audit would strand.
+ */
+async function runAudit(env: Env, auditId: string, targetUrl: string) {
+  const log = (message: string) => console.warn(`[audit ${auditId}] ${message}`);
+
+  const fail = async (code: string, message: string) => {
+    await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ?")
+      .bind(code, message, Date.now(), auditId).run()
+      .catch(() => log("could not record failure"));
+  };
+
+  try {
+    await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'")
+      .bind(Date.now(), auditId).run();
+
+    const scan = await scanPage(targetUrl, env, isBlockedHostname, (warning) => log(warning));
+
+    // Findings are real from here; only the remediation text is model-generated.
+    await env.DB.prepare("UPDATE audits SET status = 'generating', final_url = ?, page_title = ?, axe_version = ? WHERE id = ?")
+      .bind(scan.finalUrl, scan.pageTitle, scan.axeVersion, auditId).run();
+
+    const findings = await buildFindings(scan.findings, env, (message) => log(`fixes: ${message}`));
+
+    await env.DB.prepare("UPDATE audits SET status = 'completed', report_json = ?, completed_at = ? WHERE id = ?")
+      .bind(JSON.stringify(findings), Date.now(), auditId).run();
+  } catch (error) {
+    if (error instanceof ScanError) {
+      log(`${error.code}: ${error.message}`);
+      await fail(error.code, error.message);
+      return;
+    }
+    // Unexpected: log for the operator, but never leak internals to the reporter.
+    console.error(`[audit ${auditId}] unexpected failure`, error);
+    await fail("scan_failed", "This page could not be scanned. Try again in a moment.");
+  }
+}
+
+async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionContext) {
   await ensureDatabase(env.DB);
 
   if (url.pathname === "/api/audits" && request.method === "POST") {
@@ -147,8 +186,12 @@ async function handleApi(request: Request, env: Env, url: URL) {
 
     const id = crypto.randomUUID();
     const now = Date.now();
+    const targetUrl = target.toString();
     await env.DB.prepare("INSERT INTO audits (id, submitted_url, status, request_fingerprint, created_at, expires_at) VALUES (?, ?, 'queued', ?, ?, ?)")
-      .bind(id, target.toString(), requestFingerprint, now, now + 7 * 24 * 60 * 60 * 1000).run();
+      .bind(id, targetUrl, requestFingerprint, now, now + 7 * 24 * 60 * 60 * 1000).run();
+
+    // Answer immediately and scan in the background; the client polls for the result.
+    ctx.waitUntil(runAudit(env, id, targetUrl));
     return json({ id, status: "queued" }, 202);
   }
 
@@ -160,49 +203,30 @@ async function handleApi(request: Request, env: Env, url: URL) {
     const createdAt = new Date(row.created_at).toISOString();
     const progress = (status: AuditStatus) => json({ id: row.id, url: row.submitted_url, status, createdAt, findings: [] });
 
-    const elapsed = Date.now() - row.created_at;
+    if (row.status === "completed") {
+      return json({
+        id: row.id,
+        url: row.submitted_url,
+        finalUrl: row.final_url || row.submitted_url,
+        pageTitle: row.page_title,
+        status: row.status,
+        createdAt,
+        completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined,
+        findings: row.report_json ? JSON.parse(row.report_json) : [],
+      });
+    }
 
-    // Reclaim a generation whose isolate never came back, so the audit resolves
-    // instead of stranding the client in an endless poll.
-    if (row.status === "generating" && elapsed > GENERATE_AFTER_MS + GENERATION_STALE_MS) {
-      const message = "The report did not finish generating. Try scanning this page again.";
-      await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ? AND status = 'generating'")
-        .bind("report_generation_stalled", message, Date.now(), row.id).run();
+    if (row.status === "failed") return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt, findings: [], error: row.error_message || "The scan failed." });
+
+    // Still working. The job runs in `waitUntil`; if that isolate was evicted nothing
+    // will ever finish it, so a reader retires the audit rather than polling forever.
+    if (Date.now() - row.created_at > JOB_STALE_MS) {
+      const message = "This scan did not finish. Try scanning the page again.";
+      await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ? AND status NOT IN ('completed', 'failed')")
+        .bind("scan_stalled", message, Date.now(), row.id).run();
       return json({ id: row.id, url: row.submitted_url, status: "failed", createdAt, findings: [], error: message });
     }
 
-    if (row.status === "queued" && elapsed > RUNNING_AFTER_MS) {
-      await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'").bind(Date.now(), row.id).run();
-      row.status = "running";
-    }
-
-    if ((row.status === "queued" || row.status === "running") && elapsed > GENERATE_AFTER_MS) {
-      // Claim the transition so concurrent pollers cannot each spend a model request.
-      const claim = await env.DB.prepare("UPDATE audits SET status = 'generating' WHERE id = ? AND status IN ('queued', 'running')").bind(row.id).run();
-      if (claim.meta.changes === 0) return progress("generating");
-
-      let host = "Scanned page";
-      try { host = new URL(row.submitted_url).hostname; } catch { /* normalized on input */ }
-      const pageTitle = `${host} — scanned page`;
-
-      try {
-        const findings = await buildFindings(representativeFindings(), env, (message) => console.warn(`[fixes] audit ${row.id}: ${message}`));
-        const completedAt = Date.now();
-        await env.DB.prepare("UPDATE audits SET status = 'completed', final_url = ?, page_title = ?, axe_version = ?, report_json = ?, completed_at = ? WHERE id = ?")
-          .bind(row.submitted_url, pageTitle, "4.x", JSON.stringify(findings), completedAt, row.id).run();
-        return json({ id: row.id, url: row.submitted_url, finalUrl: row.submitted_url, pageTitle, status: "completed", createdAt, completedAt: new Date(completedAt).toISOString(), findings, prototype: true });
-      } catch (error) {
-        // Never leave a claimed audit stuck in 'generating'.
-        console.error(`[fixes] audit ${row.id} failed`, error);
-        const message = "The report could not be generated. Try scanning this page again.";
-        await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ?")
-          .bind("report_generation_failed", message, Date.now(), row.id).run();
-        return json({ id: row.id, url: row.submitted_url, status: "failed", createdAt, findings: [], error: message });
-      }
-    }
-
-    if (row.status === "completed") return json({ id: row.id, url: row.submitted_url, finalUrl: row.final_url, pageTitle: row.page_title, status: row.status, createdAt, completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined, findings: row.report_json ? JSON.parse(row.report_json) : [], prototype: true });
-    if (row.status === "failed") return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt, findings: [], error: row.error_message || "The scan failed." });
     return progress(row.status);
   }
 
@@ -212,7 +236,7 @@ async function handleApi(request: Request, env: Env, url: URL) {
 const worker = {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/audits")) return handleApi(request, env, url);
+    if (url.pathname.startsWith("/api/audits")) return handleApi(request, env, url, ctx);
 
     if (url.pathname === "/_vinext/image") {
       const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
