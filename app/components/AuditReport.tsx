@@ -107,6 +107,12 @@ export function AuditReport({ auditId }: { auditId: string }) {
         </summary>
         <div className="finding-detail">
           <div className="finding-explanation">
+            <div className="finding-meta">
+              {finding.context && <span className="meta-chip">{finding.context}</span>}
+              <span className={`meta-chip detector-${finding.detector}`}>
+                {finding.detector === "axe" ? "Measured by axe-core" : finding.detector === "heuristic" ? "Observed by keyboard and layout checks" : "AI suggestion — verify before acting"}
+              </span>
+            </div>
             <p>{finding.explanation}</p>
             {finding.wcag.length > 0 && (
               <div className="wcag-links"><span>{advisory ? "Reference" : "WCAG references"}</span>{finding.wcag.map((item) => <a key={item.label} href={item.href} target="_blank" rel="noreferrer">{item.label} ↗</a>)}</div>

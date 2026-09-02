@@ -33,6 +33,8 @@ export type FindingInput = {
   wcag: WcagReference[];
   count: number;
   occurrences: Occurrence[];
+  /** Where the finding was observed, e.g. "Desktop and mobile". Shown as a badge. */
+  context?: string;
 };
 
 export type FixSuggestion = {

@@ -6,6 +6,8 @@ Clarity is an AI-assisted accessibility scanner interface for one public webpage
 
 Submitted pages are really scanned. Cloudflare Browser Rendering opens the URL in a headless Chromium, `axe-core` runs against the rendered DOM, and what it reports becomes the report. Remediations are generated from those findings by a schema-validated model call. If a scan cannot run, the audit fails and says so — the product never invents findings.
 
+A scan is four passes: axe at desktop, a keyboard walk that presses Tab for real to find focus traps and missing focus indicators, axe again at a 390px mobile viewport, and a reflow measurement at 320px. The last three are best-effort — if one fails the desktop results still stand, and the scan logs what each pass did.
+
 Findings come back in two tiers. **Violations** map to a WCAG 2.2 A/AA success criterion and are the only ones counted in the report's totals. **Advisory notes** are axe best-practice rules — real problems worth fixing, but not WCAG failures — and are listed separately so they never inflate a score.
 
 The product never describes an automated scan as certification. Every report states that manual testing and assistive-technology evaluation are still required.
@@ -86,3 +88,5 @@ npm run deploy
 Every page is treated as untrusted. The scanner validates the submitted URL, re-validates the destination of every request the page makes, re-checks the URL it actually landed on after redirects, dismisses dialogs, bounds every stored snippet, and enforces navigation, axe, and whole-job timeouts. Cloudflare owns the browser isolation.
 
 One gap remains: hostnames are checked, but their resolved addresses are not, so DNS rebinding is not covered. See `HANDOFF.md`.
+
+The scanner presses Tab, but never clicks, submits a form, or dismisses a banner. It will not interact with a page it does not own beyond keyboard navigation.

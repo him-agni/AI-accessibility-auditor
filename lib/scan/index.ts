@@ -12,6 +12,8 @@ import puppeteer from "@cloudflare/puppeteer";
 // executed inside the Worker itself — only in the isolated browser tab.
 import axeSource from "axe-core/axe.min.js?raw";
 import { normalizeViolations } from "./normalize";
+import { walkFocusOrder, keyboardFindings } from "./keyboard";
+import { measureReflowAt, reflowFindings, mergeByViewport, DESKTOP_VIEWPORT, MOBILE_VIEWPORT } from "./viewport";
 import type { FindingInput } from "../fixes/types";
 
 /** The Browser Rendering binding, as `puppeteer.launch` expects it. */
@@ -38,9 +40,11 @@ export class ScanError extends Error {
 
 const NAVIGATION_TIMEOUT_MS = 25_000;
 const AXE_TIMEOUT_MS = 30_000;
+/** Each optional pass gets its own budget; overrunning one costs only that pass. */
+const EXTRA_PASS_TIMEOUT_MS = 20_000;
 /** Ceiling for the whole job, so one page can never hold a browser session open. */
-const TOTAL_JOB_TIMEOUT_MS = 55_000;
-const VIEWPORT = { width: 1440, height: 900 };
+const TOTAL_JOB_TIMEOUT_MS = 90_000;
+const VIEWPORT = DESKTOP_VIEWPORT;
 const USER_AGENT_SUFFIX = "ClarityAccessibilityScanner/0.1 (+automated accessibility scan)";
 
 /**
@@ -168,27 +172,65 @@ async function runScan(
     throw new ScanError("axe_injection_failed", "The accessibility engine could not run on this page.");
   });
 
-  const raw = await withTimeout(
-    page.evaluate(async (options) => {
-      const globalAxe = (globalThis as unknown as { axe?: { run: (opts: unknown) => Promise<unknown>; version?: string } }).axe;
-      if (!globalAxe) return null;
-      const results = await globalAxe.run(options) as { violations?: unknown };
-      return { violations: results?.violations ?? [], version: globalAxe.version ?? "", title: document.title || "" };
-    }, AXE_RUN_OPTIONS as unknown as Record<string, unknown>),
-    AXE_TIMEOUT_MS,
-    "axe_timeout",
-    "The accessibility checks took too long on this page.",
-  ).catch((error: unknown) => {
-    if (error instanceof ScanError) throw error;
-    throw new ScanError("axe_failed", "The accessibility checks could not complete on this page.");
-  });
+  const runAxe = () => page.evaluate(async (options) => {
+    const globalAxe = (globalThis as unknown as { axe?: { run: (opts: unknown) => Promise<unknown>; version?: string } }).axe;
+    if (!globalAxe) return null;
+    const results = await globalAxe.run(options) as { violations?: unknown };
+    return { violations: results?.violations ?? [], version: globalAxe.version ?? "", title: document.title || "" };
+  }, AXE_RUN_OPTIONS as unknown as Record<string, unknown>);
+
+  const raw = await withTimeout(runAxe(), AXE_TIMEOUT_MS, "axe_timeout", "The accessibility checks took too long on this page.")
+    .catch((error: unknown) => {
+      if (error instanceof ScanError) throw error;
+      throw new ScanError("axe_failed", "The accessibility checks could not complete on this page.");
+    });
 
   if (!raw) throw new ScanError("axe_failed", "The accessibility engine did not load on this page.");
 
   const pageTitle = typeof raw.title === "string" && raw.title.trim() ? raw.title.trim().slice(0, 200) : new URL(finalUrl).hostname;
+  const desktopFindings = normalizeViolations(raw.violations);
+
+  /**
+   * Everything past this point is additive. The desktop axe pass above is the
+   * product's floor; an optional pass that times out or throws contributes nothing
+   * and is logged, but it must never cost the caller the results already in hand.
+   */
+  const optional = async <T>(label: string, run: () => Promise<T>, empty: T): Promise<T> => {
+    try {
+      return await withTimeout(run(), EXTRA_PASS_TIMEOUT_MS, "pass_timeout", `${label} timed out`);
+    } catch (error) {
+      onWarning?.(`${label} skipped: ${error instanceof Error ? error.message : "failed"}`);
+      return empty;
+    }
+  };
+
+  // Keyboard walk before any resize, so recorded positions match the desktop layout.
+  const keyboard = await optional("keyboard walk", () => walkFocusOrder(page), null);
+
+  const mobileFindings = await optional("mobile pass", async () => {
+    await page.setViewport(MOBILE_VIEWPORT);
+    await page.evaluate(() => new Promise<void>((resolve) => setTimeout(resolve, 400)));
+    const mobile = await runAxe();
+    return mobile ? normalizeViolations(mobile.violations) : [];
+  }, [] as FindingInput[]);
+
+  const reflow = await optional("reflow pass", () => measureReflowAt(page), null);
+
+  // A pass that caught an error returns the same empty result as a clean page, so
+  // say what each one actually did. Without this, a silently broken check is
+  // indistinguishable from a page with nothing wrong.
+  onWarning?.([
+    `axe ${desktopFindings.length} rules desktop / ${mobileFindings.length} mobile`,
+    keyboard ? `keyboard ${keyboard.steps.length} stops of ${keyboard.focusableCount} focusable` : "keyboard unavailable",
+    reflow ? `reflow ${reflow.scrollWidth}px in ${reflow.clientWidth}px` : "reflow unavailable",
+  ].join(" | "));
 
   return {
-    findings: normalizeViolations(raw.violations),
+    findings: [
+      ...mergeByViewport(desktopFindings, mobileFindings),
+      ...keyboardFindings(keyboard),
+      ...reflowFindings(reflow),
+    ],
     finalUrl,
     pageTitle,
     axeVersion: typeof raw.version === "string" && raw.version ? raw.version : "4.x",

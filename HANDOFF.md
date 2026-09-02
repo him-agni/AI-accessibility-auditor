@@ -88,6 +88,23 @@ axe runs with `best-practice` alongside the WCAG tags, so all 105 of its rules e
 
 Advisories deliberately **do not go to the model**. They are lower stakes and more numerous, and including them would grow the prompt without changing what a team fixes first, so they always take deterministic guidance. An audit therefore stays at exactly one model request no matter how many best-practice notes a page produces.
 
+### What a scan does, in order
+
+1. **Desktop axe pass** at 1440×900 — the product's floor.
+2. **Keyboard walk** (`lib/scan/keyboard.ts`) — presses Tab for real, up to 60 times, recording where focus lands, then re-focuses each visited element to see whether its appearance changes at all. Produces `keyboard-trap`, `keyboard-trap-cycle`, `focus-on-hidden-element`, `focus-not-visible` (all violations) and `focus-order-jumps` (advisory). Runs before any resize so recorded positions match the desktop layout.
+3. **Mobile axe pass** at 390×844, merged with the desktop pass by rule id. A rule seen at both keeps the **higher** count, never the sum — they are two measurements of one page. Each finding carries `context`: "Desktop", "Mobile only", or "Desktop and mobile".
+4. **Reflow measurement** at 320 CSS px (`lib/scan/viewport.ts`) — the width a 1280px viewport reaches at 400% zoom. Horizontal overflow beyond an 8px scrollbar tolerance is a WCAG 1.4.10 violation, naming the outermost offending element.
+
+**Steps 2–4 are strictly best-effort.** Each has its own 20s budget, and a pass that throws or times out contributes nothing and logs why. The desktop axe results must never be lost because an extra check misbehaved — that is the whole reason they are separate passes rather than inline.
+
+Because a caught error and a clean page both produce zero findings, every scan logs what each pass actually did:
+
+```
+axe 6 rules desktop / 9 mobile | keyboard 60 stops of 1387 focusable | reflow 1187px in 320px
+```
+
+Without that line a silently broken detector is indistinguishable from a page with nothing wrong. Keep it.
+
 ### How a scan runs
 
 `POST /api/audits` validates the URL, stores a `queued` row, answers `202`, and starts the job with `ctx.waitUntil` — so the submission returns immediately and the client polls a real job rather than a timer. The job walks `queued → running → generating → completed`, or to `failed` with a stable `error_code`. Because the job lives in `waitUntil`, nothing re-drives it if that isolate is evicted; a reader retires any audit still non-terminal after `JOB_STALE_MS` (150s).
@@ -201,7 +218,7 @@ Re-run on August 28, 2026 after connecting the scanner:
 | Production build | `npm run build` | pass — 5/5 environments |
 | Type check | `npx tsc --noEmit` | pass — no errors |
 | Lint | `npm run lint` | pass — no warnings |
-| Tests | `npm test` | pass — 33/33 (was 27) |
+| Tests | `npm test` | pass — 48/48 (was 33) |
 | Deploy config | `npm run deploy -- --dry-run` | pass — resolves `DB`, `IMAGES`, `ASSETS` |
 
 **Live scans verified against real pages** through `wrangler dev`, which runs a real local Chromium:
@@ -212,6 +229,8 @@ Re-run on August 28, 2026 after connecting the scanner:
 | `example.com` | completed, 0 findings — genuinely clean, title "Example Domain" read from the live DOM |
 | `wikipedia.org` | completed, 0 findings |
 | `w3.org/WAI/demos/bad/…` | failed with "The page returned HTTP 403" — the site blocked the request, reported honestly |
+| `en.wikipedia.org` (wide table) | all three heuristics fired: reflow `1187px in 320px` blaming `thead`; `focus-on-hidden-element` ×6 on Vector's CSS-only dropdown checkboxes; `focus-order-jumps` ×3 as advisory |
+| `bbc.com/news`, `arxiv.org`, `info.cern.ch` | scanned clean of heuristic findings — the detectors stay silent on well-built pages rather than manufacturing noise |
 
 `target-size` appearing confirms the WCAG 2.2 AA tag set is active. The three-per-hour rate limit fired mid-testing, which was its own confirmation.
 
@@ -232,7 +251,10 @@ Clarity's central product claim is that it never overstates what it did. Three p
 1. **The scan has not been exercised against the deployed Browser Rendering service** — only against the local Chromium `wrangler dev` provides. Remote behaviour (cold starts, session acquisition, concurrency limits) is unverified. Confirm after the first deploy.
 2. The Gemini path has not been exercised against the live API; it is verified only against a stubbed endpoint. Confirm with a real key before relying on it.
 3. **DNS rebinding is not addressed.** Every request the page makes is re-validated by hostname (`page.on("request")`), and the landed URL is re-checked after redirects, but a hostname that resolves to a private address still passes — the guard never sees resolved IPs. Cloudflare's browser runs outside our network, which limits the blast radius, but this is the remaining gap in the URL-guard story.
-4. Only one page state is scanned: no interaction, no scrolling, no dismissing of cookie banners. A page that renders its real content only after consent will be scanned in its pre-consent state.
+4. Only one page state is scanned: aside from pressing Tab, there is no interaction, no scrolling, and no dismissing of cookie banners. A page that renders its real content only after consent will be scanned in its pre-consent state.
+4a. The keyboard walk stops at 60 Tab presses, so on a large page it covers only the first 60 stops — Wikipedia has 1387 focusable elements. A trap past that point is not detected.
+4b. The focus-indicator check compares computed styles on the element and its parent. An indicator drawn only via `::before`/`::after`, or on a distant ancestor, will be missed. It errs toward silence rather than false alarms.
+4c. Reflow is measured from `documentElement.scrollWidth`. A page using `overflow-x: hidden` clips its overflow instead of scrolling, so the measurement reads clean even though content is cut off.
 5. Some sites block automated browsers outright. The scan surfaces that as an honest `http_error` (a 403 from `w3.org` was seen during testing) rather than an empty report.
 6. No queue or retry dashboard yet. Worker observability is enabled in `wrangler.jsonc`.
 7. No scheduled cleanup physically deletes expired audits. A Workers cron trigger is the natural home for this.
@@ -259,8 +281,8 @@ The scanner milestone is done. What is left of it, and what came next:
 
 Agreed order for widening what the auditor detects. The `kind`/`detector` split above is the enabling change and is done, so each of these can land independently:
 
-1. **Keyboard and focus walk** (`detector: heuristic`) — press Tab through the page in the real browser and record `document.activeElement` and its box at each step. Catches genuine keyboard traps, focus on invisible elements, jarring visual order, and missing focus indicators. Deterministic, no model, and it covers the largest category axe structurally cannot reach. Highest value; note it changes the "no keyboard simulation" scope decision below.
-2. **Second viewport (390px) and 200% zoom** — re-run axe after `setViewport`. Unlocks reflow (1.4.10) and changes `target-size` entirely. Nearly free.
+1. ~~Keyboard and focus walk.~~ Done, September 2, 2026.
+2. ~~Second viewport and reflow.~~ Done, September 2, 2026. Text resize at 200% (SC 1.4.4) was **not** built — bumping font sizes and detecting clipping produces too many false positives to assert as a failure. The 320px reflow test covers the same ground more defensibly.
 3. **Fake interactive elements** (`detector: heuristic`) — an element with a click listener but no role, no tabindex, and `cursor: pointer` is a button that assistive technology cannot see. Detect via CDP `DOMDebugger.getEventListeners`; the model only writes the suggested label.
 4. **Static form-error plumbing** — `aria-describedby` wiring, `aria-live` regions, `aria-invalid`. **Do not submit forms on third-party sites** to observe dynamic errors: that can create accounts, send messages, or trigger purchases on pages we do not own. Static checks only.
 5. **Accessible authentication (SC 3.3.8)** — paste blocked on password fields, missing `autocomplete="username"`/`"current-password"`, CAPTCHA present. Narrow, only fires on login pages, but nothing else reports it.
@@ -306,3 +328,7 @@ For every future change:
 - August 28, 2026 — Kept "no browser binding" as a hard failure rather than a fallback to example data. This is the same decision as August 3's removal of the client-side fallback, and it is the one the product's central claim rests on.
 - September 2, 2026 — Turned on axe's 30 `best-practice` rules, taking the scanner from 70 of 105 rules to all 105. Verified on `news.ycombinator.com`: three findings we had been blind to (`landmark-one-main`, `page-has-heading-one`, `region`) with the headline count unchanged.
 - September 2, 2026 — Added `kind` and `detector` to every finding, and split the report into WCAG failures and advisory notes. Chose two fields over one because they are independent axes: a future heuristic check for keyboard traps would be `detector: heuristic` *and* `kind: violation` (WCAG 2.1.2), so collapsing them would force a wrong answer. Advisories are excluded from all headline numbers and from the model prompt.
+- September 2, 2026 — Added the keyboard walk, the mobile axe pass, and the 320px reflow measurement. This reverses the standing "no keyboard simulation" scope decision, deliberately: whether a keyboard user can escape a widget, or see where they are, is the largest category axe structurally cannot reach, and it is only answerable by driving the browser.
+- September 2, 2026 — Made the extra passes best-effort with their own budgets, and made every scan log what each pass did. A caught error and a clean page both yield zero findings; without the log line the two are indistinguishable, which would let a broken detector look like good news indefinitely.
+- September 2, 2026 — Merged the two viewports by taking the higher element count per rule rather than the sum. Ten contrast failures at desktop and fourteen at mobile are one page measured twice, not twenty-four problems; summing them would inflate the only number the report leads with.
+- September 2, 2026 — Filed tab-order reversals as `advisory`. Focus jumping up the page is often legitimate, and the reading order it implies is a judgement the scan cannot make. This is the first finding whose kind was chosen for honesty rather than severity, and it is the pattern later heuristics should follow.
