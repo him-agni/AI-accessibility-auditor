@@ -18,14 +18,15 @@
     "deploy": "npm run build && wrangler deploy -c dist/server/wrangler.json"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "1.4.0",
     "axe-core": "4.13.0",
     "drizzle-orm": "0.45.2",
     "next": "16.2.6",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "vinext": "0.0.50"
   },
   "devDependencies": {
-    "@cloudflare/puppeteer": "1.4.0",
     "@cloudflare/vite-plugin": "1.37.1",
     "@tailwindcss/postcss": "4.2.1",
     "@types/node": "22.19.19",
@@ -39,7 +40,6 @@
     "react-server-dom-webpack": "19.2.6",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
-    "vinext": "0.0.50",
     "vite": "8.0.13",
     "wrangler": "4.92.0"
   },

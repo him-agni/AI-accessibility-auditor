@@ -16,7 +16,7 @@ const ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models";
 
 /** Overridable via GEMINI_MODEL; any free-tier text model works (e.g. gemini-2.0-flash). */
 export const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
-export const GEMINI_PROMPT_VERSION = "fix-v1";
+const GEMINI_PROMPT_VERSION = "fix-v1";
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_OCCURRENCES_PER_GROUP = 3;

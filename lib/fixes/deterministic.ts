@@ -7,9 +7,9 @@
  */
 import type { Confidence, FindingInput, FixSuggestion } from "./types";
 
-export const DETERMINISTIC_PROVIDER = "deterministic";
-export const DETERMINISTIC_MODEL = "axe-wcag-guidance";
-export const DETERMINISTIC_PROMPT_VERSION = "static-1";
+const DETERMINISTIC_PROVIDER = "deterministic";
+const DETERMINISTIC_MODEL = "axe-wcag-guidance";
+const DETERMINISTIC_PROMPT_VERSION = "static-1";
 
 type FixBody = {
   summary: string;

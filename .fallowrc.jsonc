@@ -1,0 +1,5 @@
+{
+  // Optional peers of vinext: it loads them itself to build the App Router RSC
+  // environments, so nothing in this repo imports them directly.
+  "ignoreDependencies": ["@vitejs/plugin-rsc", "react-server-dom-webpack"]
+}

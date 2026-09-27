@@ -41,11 +41,16 @@ test("keeps the finished product free of disposable starter files", async () => 
   assert.match(page, /<ScanForm \/>/);
   assert.match(layout, /Clarity — AI-assisted accessibility scanner/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton|site-creator-vinext-starter/);
-  await assert.rejects(access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)));
   await access(new URL("public/og.png", projectRoot));
 
   // Starter scaffold that shipped with the template and is no longer referenced.
-  for (const removed of ["app/chatgpt-auth.ts", "public/file.svg", "public/globe.svg", "public/window.svg"]) {
+  for (const removed of [
+    "app/_sites-preview/SkeletonPreview.tsx",
+    "app/chatgpt-auth.ts",
+    "public/file.svg",
+    "public/globe.svg",
+    "public/window.svg",
+  ]) {
     await assert.rejects(access(new URL(removed, projectRoot)), `${removed} should stay deleted`);
   }
 });
