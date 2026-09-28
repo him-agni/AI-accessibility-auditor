@@ -103,46 +103,51 @@ function toOccurrence(node: AxeNode): Occurrence | null {
   };
 }
 
+/** One axe violation as a report finding, or null if it has no usable evidence. */
+function toFinding(raw: AxeViolation): FindingInput | null {
+  const ruleId = text(raw?.id, 80);
+  if (!ruleId) return null;
+
+  const nodes = Array.isArray(raw.nodes) ? (raw.nodes as AxeNode[]) : [];
+  const occurrences = nodes.slice(0, MAX_OCCURRENCES_STORED).map(toOccurrence).filter((item): item is Occurrence => item !== null);
+  // A violation with no usable element evidence is not worth reporting.
+  if (occurrences.length === 0) return null;
+
+  const help = text(raw.help, MAX_TITLE_CHARS);
+  const description = text(raw.description, MAX_EXPLANATION_CHARS);
+  const helpUrl = typeof raw.helpUrl === "string" && /^https?:\/\//i.test(raw.helpUrl) ? raw.helpUrl : "";
+
+  return {
+    ruleId,
+    kind: classify(raw.tags),
+    detector: "axe",
+    impact: impactOf(raw.impact),
+    title: help || ruleId,
+    explanation: description || help || "axe-core reported this rule as failing on the page.",
+    wcag: wcagReferences(raw.tags, helpUrl),
+    // `count` is the true total; `occurrences` is the bounded sample shown as evidence.
+    count: nodes.length,
+    occurrences,
+  };
+}
+
+const bySeverity = (a: FindingInput, b: FindingInput) =>
+  (IMPACT_ORDER.get(a.impact) ?? 9) - (IMPACT_ORDER.get(b.impact) ?? 9) || b.count - a.count;
+
+function topOfKind(findings: FindingInput[], kind: FindingKind, limit: number) {
+  return findings.filter((finding) => finding.kind === kind).sort(bySeverity).slice(0, limit);
+}
+
 /** Convert axe violations into report findings, most severe first. */
 export function normalizeViolations(violations: unknown): FindingInput[] {
   if (!Array.isArray(violations)) return [];
 
-  const findings: FindingInput[] = [];
-
-  for (const raw of violations as AxeViolation[]) {
-    const ruleId = text(raw?.id, 80);
-    if (!ruleId) continue;
-
-    const nodes = Array.isArray(raw.nodes) ? (raw.nodes as AxeNode[]) : [];
-    const occurrences = nodes.slice(0, MAX_OCCURRENCES_STORED).map(toOccurrence).filter((item): item is Occurrence => item !== null);
-    // A violation with no usable element evidence is not worth reporting.
-    if (occurrences.length === 0) continue;
-
-    const help = text(raw.help, MAX_TITLE_CHARS);
-    const description = text(raw.description, MAX_EXPLANATION_CHARS);
-    const helpUrl = typeof raw.helpUrl === "string" && /^https?:\/\//i.test(raw.helpUrl) ? raw.helpUrl : "";
-
-    findings.push({
-      ruleId,
-      kind: classify(raw.tags),
-      detector: "axe",
-      impact: impactOf(raw.impact),
-      title: help || ruleId,
-      explanation: description || help || "axe-core reported this rule as failing on the page.",
-      wcag: wcagReferences(raw.tags, helpUrl),
-      // `count` is the true total; `occurrences` is the bounded sample shown as evidence.
-      count: nodes.length,
-      occurrences,
-    });
-  }
-
-  const bySeverity = (a: FindingInput, b: FindingInput) =>
-    (IMPACT_ORDER.get(a.impact) ?? 9) - (IMPACT_ORDER.get(b.impact) ?? 9) || b.count - a.count;
+  const findings = (violations as AxeViolation[]).map(toFinding).filter((finding): finding is FindingInput => finding !== null);
 
   // Violations first and capped independently, so a page full of best-practice
   // notes can never push a real WCAG failure out of the report.
   return [
-    ...findings.filter((finding) => finding.kind === "violation").sort(bySeverity).slice(0, MAX_VIOLATION_GROUPS),
-    ...findings.filter((finding) => finding.kind === "advisory").sort(bySeverity).slice(0, MAX_ADVISORY_GROUPS),
+    ...topOfKind(findings, "violation", MAX_VIOLATION_GROUPS),
+    ...topOfKind(findings, "advisory", MAX_ADVISORY_GROUPS),
   ];
 }

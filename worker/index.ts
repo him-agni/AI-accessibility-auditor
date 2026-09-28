@@ -78,34 +78,63 @@ function json(body: unknown, status = 200) {
 }
 
 /**
+ * IPv4 ranges a scan must never reach: "this" network, private, loopback,
+ * link-local, and everything from multicast up. Each entry is an inclusive range
+ * for the first octet and, where the block is narrower than /8, the second.
+ */
+const BLOCKED_IPV4_RANGES: { first: [number, number]; second?: [number, number] }[] = [
+  { first: [0, 0] },
+  { first: [10, 10] },
+  { first: [127, 127] },
+  { first: [169, 169], second: [254, 254] },
+  { first: [172, 172], second: [16, 31] },
+  { first: [192, 192], second: [168, 168] },
+  { first: [224, 255] },
+];
+
+/**
  * IPv6 forms that carry an IPv4 address in their low 32 bits. `new URL()` re-renders
- * `::ffff:127.0.0.1` as `::ffff:7f00:1`, so the dotted-quad branch never sees them
+ * `::ffff:127.0.0.1` as `::ffff:7f00:1`, so the dotted-quad check never sees them
  * unless we decode the trailing hex groups back to an address first.
  */
 const EMBEDDED_IPV4 = /^(?:::ffff:|64:ff9b::)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
 
+const LOCAL_SUFFIXES = [".localhost", ".local", ".internal"];
+
+const inRange = (value: number, [min, max]: [number, number]) => value >= min && value <= max;
+const isOctet = (part: number) => Number.isInteger(part) && inRange(part, [0, 255]);
+
 function isBlockedIPv4(host: string) {
   const parts = host.split(".").map(Number);
-  if (parts.length !== 4 || !parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return false;
+  if (parts.length !== 4 || !parts.every(isOctet)) return false;
   const [a, b] = parts;
-  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || a >= 224;
+  return BLOCKED_IPV4_RANGES.some(({ first, second }) => inRange(a, first) && (!second || inRange(b, second)));
+}
+
+function isLocalName(host: string) {
+  return host === "localhost" || LOCAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
+}
+
+/** Loopback, unspecified, fc00::/7 unique-local and fe80::/10 link-local. */
+function isPrivateIPv6(host: string) {
+  // Both prefixes are four hex digits wide — matching only three silently
+  // exempted every ULA address.
+  return host === "::1" || host === "::" || /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host);
+}
+
+/** Decode an IPv4-mapped or NAT64 IPv6 address to dotted-quad, or return null. */
+function embeddedIPv4(host: string) {
+  const embedded = EMBEDDED_IPV4.exec(host);
+  if (!embedded) return null;
+  const high = parseInt(embedded[1], 16);
+  const low = parseInt(embedded[2], 16);
+  return `${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`;
 }
 
 function isBlockedHostname(hostname: string) {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) return true;
-  // fc00::/7 unique-local and fe80::/10 link-local. Both prefixes are four hex digits
-  // wide — matching only three silently exempted every ULA address.
-  if (host === "::1" || host === "::" || /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe[89ab][0-9a-f]:/i.test(host)) return true;
-
-  const embedded = EMBEDDED_IPV4.exec(host);
-  if (embedded) {
-    const high = parseInt(embedded[1], 16);
-    const low = parseInt(embedded[2], 16);
-    return isBlockedIPv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
-  }
-
-  return isBlockedIPv4(host);
+  if (isLocalName(host) || isPrivateIPv6(host)) return true;
+  return isBlockedIPv4(embeddedIPv4(host) ?? host);
 }
 
 async function fingerprint(request: Request) {
@@ -165,70 +194,94 @@ async function runAudit(env: Env, auditId: string, targetUrl: string) {
   }
 }
 
+const MAX_URL_LENGTH = 2048;
+const SCANS_PER_HOUR = 3;
+const HOUR_MS = 60 * 60 * 1000;
+const REPORT_TTL_MS = 7 * 24 * HOUR_MS;
+
+/** Parse and vet a submitted URL. Returns the URL to scan, or the reason it was refused. */
+async function parseTarget(request: Request): Promise<URL | string> {
+  let input: { url?: string };
+  try { input = await request.json() as { url?: string }; } catch { return "Provide a valid URL."; }
+
+  let target: URL;
+  try { target = new URL(input.url || ""); } catch { return "Enter a complete public URL."; }
+
+  const isPublicHttp = ["http:", "https:"].includes(target.protocol)
+    && !target.username
+    && !target.password
+    && !isBlockedHostname(target.hostname)
+    && target.href.length <= MAX_URL_LENGTH;
+  if (!isPublicHttp) return "This scanner accepts public HTTP or HTTPS pages only.";
+
+  target.hash = "";
+  return target;
+}
+
+/** POST /api/audits — queue a scan and answer before it runs. */
+async function createAudit(request: Request, env: Env, ctx: ExecutionContext) {
+  const target = await parseTarget(request);
+  if (typeof target === "string") return json({ message: target }, 400);
+
+  const requestFingerprint = await fingerprint(request);
+  const usage = await env.DB.prepare("SELECT COUNT(*) AS count FROM audits WHERE request_fingerprint = ? AND created_at > ?").bind(requestFingerprint, Date.now() - HOUR_MS).first<{ count: number }>();
+  if ((usage?.count || 0) >= SCANS_PER_HOUR) return json({ message: "You have reached the anonymous limit of three scans per hour." }, 429);
+
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const targetUrl = target.toString();
+  await env.DB.prepare("INSERT INTO audits (id, submitted_url, status, request_fingerprint, created_at, expires_at) VALUES (?, ?, 'queued', ?, ?, ?)")
+    .bind(id, targetUrl, requestFingerprint, now, now + REPORT_TTL_MS).run();
+
+  // Answer immediately and scan in the background; the client polls for the result.
+  ctx.waitUntil(runAudit(env, id, targetUrl));
+  return json({ id, status: "queued" }, 202);
+}
+
+/** Mark an abandoned audit failed, unless it reached a terminal status meanwhile. */
+async function retireStaleAudit(env: Env, id: string, message: string) {
+  await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ? AND status NOT IN ('completed', 'failed')")
+    .bind("scan_stalled", message, Date.now(), id).run();
+}
+
+/** GET /api/audits/:id — the report, the failure, or the job's current status. */
+async function readAudit(env: Env, id: string) {
+  const row = await env.DB.prepare("SELECT id, submitted_url, final_url, status, page_title, report_json, error_message, created_at, completed_at FROM audits WHERE id = ? AND expires_at > ?").bind(id, Date.now()).first<AuditRow>();
+  if (!row) return json({ error: "This report was not found or has expired." }, 404);
+
+  const base = { id: row.id, url: row.submitted_url, createdAt: new Date(row.created_at).toISOString() };
+
+  if (row.status === "completed") {
+    return json({
+      ...base,
+      finalUrl: row.final_url || row.submitted_url,
+      pageTitle: row.page_title,
+      status: row.status,
+      completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined,
+      findings: row.report_json ? JSON.parse(row.report_json) : [],
+    });
+  }
+
+  if (row.status === "failed") return json({ ...base, status: row.status, findings: [], error: row.error_message || "The scan failed." });
+
+  // Still working. The job runs in `waitUntil`; if that isolate was evicted nothing
+  // will ever finish it, so a reader retires the audit rather than polling forever.
+  if (Date.now() - row.created_at > JOB_STALE_MS) {
+    const message = "This scan did not finish. Try scanning the page again.";
+    await retireStaleAudit(env, row.id, message);
+    return json({ ...base, status: "failed", findings: [], error: message });
+  }
+
+  return json({ ...base, status: row.status, findings: [] });
+}
+
 async function handleApi(request: Request, env: Env, url: URL, ctx: ExecutionContext) {
   await ensureDatabase(env.DB);
 
-  if (url.pathname === "/api/audits" && request.method === "POST") {
-    let input: { url?: string };
-    try { input = await request.json() as { url?: string }; } catch { return json({ message: "Provide a valid URL." }, 400); }
-
-    let target: URL;
-    try { target = new URL(input.url || ""); } catch { return json({ message: "Enter a complete public URL." }, 400); }
-    if (!["http:", "https:"].includes(target.protocol) || target.username || target.password || isBlockedHostname(target.hostname) || target.href.length > 2048) {
-      return json({ message: "This scanner accepts public HTTP or HTTPS pages only." }, 400);
-    }
-
-    target.hash = "";
-    const requestFingerprint = await fingerprint(request);
-    const hourAgo = Date.now() - 60 * 60 * 1000;
-    const usage = await env.DB.prepare("SELECT COUNT(*) AS count FROM audits WHERE request_fingerprint = ? AND created_at > ?").bind(requestFingerprint, hourAgo).first<{ count: number }>();
-    if ((usage?.count || 0) >= 3) return json({ message: "You have reached the anonymous limit of three scans per hour." }, 429);
-
-    const id = crypto.randomUUID();
-    const now = Date.now();
-    const targetUrl = target.toString();
-    await env.DB.prepare("INSERT INTO audits (id, submitted_url, status, request_fingerprint, created_at, expires_at) VALUES (?, ?, 'queued', ?, ?, ?)")
-      .bind(id, targetUrl, requestFingerprint, now, now + 7 * 24 * 60 * 60 * 1000).run();
-
-    // Answer immediately and scan in the background; the client polls for the result.
-    ctx.waitUntil(runAudit(env, id, targetUrl));
-    return json({ id, status: "queued" }, 202);
-  }
+  if (url.pathname === "/api/audits" && request.method === "POST") return createAudit(request, env, ctx);
 
   const match = url.pathname.match(/^\/api\/audits\/([0-9a-f-]+)$/i);
-  if (match && request.method === "GET") {
-    const row = await env.DB.prepare("SELECT id, submitted_url, final_url, status, page_title, report_json, error_message, created_at, completed_at FROM audits WHERE id = ? AND expires_at > ?").bind(match[1], Date.now()).first<AuditRow>();
-    if (!row) return json({ error: "This report was not found or has expired." }, 404);
-
-    const createdAt = new Date(row.created_at).toISOString();
-    const progress = (status: AuditStatus) => json({ id: row.id, url: row.submitted_url, status, createdAt, findings: [] });
-
-    if (row.status === "completed") {
-      return json({
-        id: row.id,
-        url: row.submitted_url,
-        finalUrl: row.final_url || row.submitted_url,
-        pageTitle: row.page_title,
-        status: row.status,
-        createdAt,
-        completedAt: row.completed_at ? new Date(row.completed_at).toISOString() : undefined,
-        findings: row.report_json ? JSON.parse(row.report_json) : [],
-      });
-    }
-
-    if (row.status === "failed") return json({ id: row.id, url: row.submitted_url, status: row.status, createdAt, findings: [], error: row.error_message || "The scan failed." });
-
-    // Still working. The job runs in `waitUntil`; if that isolate was evicted nothing
-    // will ever finish it, so a reader retires the audit rather than polling forever.
-    if (Date.now() - row.created_at > JOB_STALE_MS) {
-      const message = "This scan did not finish. Try scanning the page again.";
-      await env.DB.prepare("UPDATE audits SET status = 'failed', error_code = ?, error_message = ?, completed_at = ? WHERE id = ? AND status NOT IN ('completed', 'failed')")
-        .bind("scan_stalled", message, Date.now(), row.id).run();
-      return json({ id: row.id, url: row.submitted_url, status: "failed", createdAt, findings: [], error: message });
-    }
-
-    return progress(row.status);
-  }
+  if (match && request.method === "GET") return readAudit(env, match[1]);
 
   return json({ error: "Not found" }, 404);
 }

@@ -3,6 +3,29 @@
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
 
+/** A quick client-side check; the server re-validates everything. */
+function parseWebUrl(value: string) {
+  try {
+    const parsed = new URL(value);
+    const isWeb = ["http:", "https:"].includes(parsed.protocol) && !parsed.username && !parsed.password;
+    return isWeb ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Queue a scan and return its audit id. Throws with a message fit to show. */
+async function startAudit(url: string) {
+  const response = await fetch("/api/audits", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  const data = await response.json() as { id?: string; message?: string };
+  if (!response.ok || !data.id) throw new Error(data.message || "We could not start this scan.");
+  return data.id;
+}
+
 export function ScanForm() {
   const router = useRouter();
   const [url, setUrl] = useState("");
@@ -13,26 +36,13 @@ export function ScanForm() {
     event.preventDefault();
     setError("");
 
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-      if (!["http:", "https:"].includes(parsed.protocol)) throw new Error();
-      if (parsed.username || parsed.password) throw new Error();
-    } catch {
-      setError("Enter a complete public URL, such as https://example.com");
-      return;
-    }
+    const parsed = parseWebUrl(url);
+    if (!parsed) return setError("Enter a complete public URL, such as https://example.com");
 
     setSubmitting(true);
     try {
-      const response = await fetch("/api/audits", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url: parsed.toString() }),
-      });
-      const data = await response.json() as { id?: string; message?: string };
-      if (!response.ok || !data.id) throw new Error(data.message || "We could not start this scan.");
-      router.push(`/audits/${data.id}?url=${encodeURIComponent(parsed.toString())}`);
+      const id = await startAudit(parsed.toString());
+      router.push(`/audits/${id}?url=${encodeURIComponent(parsed.toString())}`);
     } catch (submissionError) {
       setError(submissionError instanceof Error ? submissionError.message : "We could not start this scan. Try again.");
       setSubmitting(false);

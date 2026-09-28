@@ -108,30 +108,47 @@ type RawFix = {
   requiresManualReview?: unknown;
 };
 
+function cleanText(value: unknown, max: number) {
+  return typeof value === "string" ? clamp(value, max) : "";
+}
+
+function cleanSteps(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((step): step is string => typeof step === "string" && step.trim().length > 0)
+    .slice(0, MAX_STEPS)
+    .map((step) => clamp(step, MAX_STEP_CHARS));
+}
+
+function cleanCodeExample(value: unknown) {
+  if (typeof value !== "string" || value.trim().length === 0) return null;
+  // Models still occasionally wrap snippets in fences despite the instruction.
+  return clamp(value.replace(/^```[a-z]*\n?/i, "").replace(/```$/, ""), MAX_CODE_CHARS);
+}
+
+function cleanConfidence(value: unknown): Confidence {
+  return CONFIDENCES.includes(value as Confidence) ? (value as Confidence) : "low";
+}
+
 /** Re-validate the model output; anything malformed is dropped so the caller falls back. */
 function normalize(raw: RawFix, finding: FindingInput, model: string): FixSuggestion | null {
-  const summary = typeof raw.summary === "string" ? clamp(raw.summary, MAX_SUMMARY_CHARS) : "";
-  const whyItMatters = typeof raw.whyItMatters === "string" ? clamp(raw.whyItMatters, MAX_WHY_CHARS) : "";
-  if (!summary || !whyItMatters) return null;
+  const summary = cleanText(raw.summary, MAX_SUMMARY_CHARS);
+  const whyItMatters = cleanText(raw.whyItMatters, MAX_WHY_CHARS);
+  const steps = cleanSteps(raw.steps);
+  if (!summary || !whyItMatters || steps.length === 0) return null;
 
-  const steps = Array.isArray(raw.steps)
-    ? raw.steps.filter((step): step is string => typeof step === "string" && step.trim().length > 0).slice(0, MAX_STEPS).map((step) => clamp(step, MAX_STEP_CHARS))
-    : [];
-  if (steps.length === 0) return null;
-
-  const confidence = CONFIDENCES.includes(raw.confidence as Confidence) ? (raw.confidence as Confidence) : "low";
-  const codeExample = typeof raw.codeExample === "string" && raw.codeExample.trim().length > 0
-    // Models still occasionally wrap snippets in fences despite the instruction.
-    ? clamp(raw.codeExample.replace(/^```[a-z]*\n?/i, "").replace(/```$/, ""), MAX_CODE_CHARS)
-    : null;
+  const confidence = cleanConfidence(raw.confidence);
+  // Review is the default. The model can waive it only for a confident fix on a
+  // rule that does not always need human judgement.
+  const requiresManualReview = raw.requiresManualReview !== false || ALWAYS_MANUAL_REVIEW.has(finding.ruleId) || confidence === "low";
 
   return {
     summary,
     whyItMatters,
     steps,
-    codeExample,
+    codeExample: cleanCodeExample(raw.codeExample),
     confidence,
-    requiresManualReview: raw.requiresManualReview !== false || ALWAYS_MANUAL_REVIEW.has(finding.ruleId) || confidence === "low",
+    requiresManualReview,
     provider: "gemini",
     model,
     promptVersion: GEMINI_PROMPT_VERSION,
@@ -149,63 +166,76 @@ function extractJson(payload: unknown): unknown {
   }
 }
 
+/** Match each parsed entry to its rule group, keeping the first valid fix per group. */
+function collectFixes(parsed: RawFix[], findings: FindingInput[], model: string) {
+  const byRuleId = new Map(findings.map((finding) => [finding.ruleId, finding]));
+  const results = new Map<string, FixSuggestion>();
+  for (const entry of parsed) {
+    const finding = typeof entry?.ruleId === "string" ? byRuleId.get(entry.ruleId) : undefined;
+    if (!finding || results.has(finding.ruleId)) continue;
+    const fix = normalize(entry, finding, model);
+    if (fix) results.set(finding.ruleId, fix);
+  }
+  return results;
+}
+
+function requestBody(findings: FindingInput[]) {
+  return JSON.stringify({
+    systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+    contents: [{ role: "user", parts: [{ text: buildPrompt(findings) }] }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      responseSchema: RESPONSE_SCHEMA,
+      temperature: 0.2,
+      // Generous, because thinking-capable models bill reasoning against this.
+      maxOutputTokens: 8192,
+    },
+  });
+}
+
 export type GeminiProviderOptions = { apiKey: string; model?: string; onError?: (message: string) => void };
 
 export function createGeminiFixProvider({ apiKey, model = DEFAULT_GEMINI_MODEL, onError }: GeminiProviderOptions): FixProvider {
+  /** One request for every rule group. Returns the parsed array, or null after reporting why. */
+  async function requestFixes(findings: FindingInput[]): Promise<RawFix[] | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+    try {
+      const response = await fetch(`${ENDPOINT}/${encodeURIComponent(model)}:generateContent`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
+        signal: controller.signal,
+        body: requestBody(findings),
+      });
+
+      if (!response.ok) {
+        // Body may carry the reason (bad key, quota, unknown model) but can also echo input.
+        onError?.(`gemini http ${response.status}`);
+        return null;
+      }
+
+      const parsed = extractJson(await response.json());
+      if (!Array.isArray(parsed)) {
+        onError?.("gemini returned no parsable array");
+        return null;
+      }
+      return parsed as RawFix[];
+    } catch (error) {
+      onError?.(error instanceof Error && error.name === "AbortError" ? "gemini timed out" : "gemini request failed");
+      return null;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   return {
     name: "gemini",
     model,
     async generate(findings) {
-      const results = new Map<string, FixSuggestion>();
-      if (findings.length === 0) return results;
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-      try {
-        const response = await fetch(`${ENDPOINT}/${encodeURIComponent(model)}:generateContent`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-goog-api-key": apiKey },
-          signal: controller.signal,
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-            contents: [{ role: "user", parts: [{ text: buildPrompt(findings) }] }],
-            generationConfig: {
-              responseMimeType: "application/json",
-              responseSchema: RESPONSE_SCHEMA,
-              temperature: 0.2,
-              // Generous, because thinking-capable models bill reasoning against this.
-              maxOutputTokens: 8192,
-            },
-          }),
-        });
-
-        if (!response.ok) {
-          // Body may carry the reason (bad key, quota, unknown model) but can also echo input.
-          onError?.(`gemini http ${response.status}`);
-          return results;
-        }
-
-        const parsed = extractJson(await response.json());
-        if (!Array.isArray(parsed)) {
-          onError?.("gemini returned no parsable array");
-          return results;
-        }
-
-        const byRuleId = new Map(findings.map((finding) => [finding.ruleId, finding]));
-        for (const entry of parsed as RawFix[]) {
-          const finding = typeof entry?.ruleId === "string" ? byRuleId.get(entry.ruleId) : undefined;
-          if (!finding || results.has(finding.ruleId)) continue;
-          const fix = normalize(entry, finding, model);
-          if (fix) results.set(finding.ruleId, fix);
-        }
-        return results;
-      } catch (error) {
-        onError?.(error instanceof Error && error.name === "AbortError" ? "gemini timed out" : "gemini request failed");
-        return results;
-      } finally {
-        clearTimeout(timeout);
-      }
+      if (findings.length === 0) return new Map();
+      const parsed = await requestFixes(findings);
+      return parsed ? collectFixes(parsed, findings, model) : new Map();
     },
   };
 }
