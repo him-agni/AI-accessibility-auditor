@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-// The pure halves of the keyboard walk and the viewport passes, bundled from source.
+// The pure halves of the keyboard walk, form checks, and viewport passes, bundled from source.
 const { keyboardFindings } = await import("../dist/test/scan/keyboard.mjs");
 const { reflowFindings, mergeByViewport } = await import("../dist/test/scan/viewport.mjs");
+const { formFindings } = await import("../dist/test/scan/forms.mjs");
 
 const step = (index, overrides = {}) => ({
   index,
@@ -94,6 +95,70 @@ test("tab-order reversals are advisory, not asserted as a failure", () => {
 test("a couple of small reversals are not enough to report", () => {
   const steps = [step(0, { y: 500 }), step(1, { y: 100 }), step(2, { y: 520 }), step(3, { y: 560 })];
   assert.equal(byRule(keyboardFindings(walk({ steps })), "focus-order-jumps"), undefined);
+});
+
+// -------------------------------------------------------------- form checks
+
+const field = (id, note) => ({ selector: `input#${id}`, html: `<input id="${id}">`, note });
+const none = () => ({ count: 0, sample: [] });
+const found = (...elements) => ({ count: elements.length, sample: elements });
+
+const inspection = (overrides = {}) => ({
+  fieldCount: 6,
+  invalidWithoutDescription: none(),
+  requiredOnlyVisual: none(),
+  unlinkedErrors: none(),
+  unannouncedForms: none(),
+  ...overrides,
+});
+
+test("reports nothing when the form checks failed or the forms are clean", () => {
+  assert.deepEqual(formFindings(null), []);
+  assert.deepEqual(formFindings(inspection()), []);
+});
+
+test("an invalid field with no attached error text is a 3.3.1 violation", () => {
+  const invalid = byRule(formFindings(inspection({ invalidWithoutDescription: found(field("email")) })), "invalid-field-no-description");
+
+  assert.ok(invalid);
+  assert.equal(invalid.kind, "violation");
+  assert.equal(invalid.detector, "heuristic");
+  assert.equal(invalid.wcag[0].label, "3.3.1 Error Identification");
+  assert.equal(invalid.occurrences[0].selector, "input#email");
+});
+
+test("an asterisk-only required field is a 1.3.1 violation", () => {
+  const required = byRule(formFindings(inspection({ requiredOnlyVisual: found(field("name")) })), "required-not-programmatic");
+
+  assert.ok(required);
+  assert.equal(required.kind, "violation");
+  assert.equal(required.wcag[0].label, "1.3.1 Info and Relationships");
+});
+
+test("unlinked error messages are advisory and quote the message as evidence", () => {
+  const unlinked = byRule(formFindings(inspection({ unlinkedErrors: found(field("phone", "Use digits only.")) })), "error-message-not-linked");
+
+  assert.ok(unlinked);
+  assert.equal(unlinked.kind, "advisory");
+  assert.match(unlinked.occurrences[0].failure, /"Use digits only\."/);
+});
+
+test("custom-validated forms without a live region are advisory, not asserted", () => {
+  const form = { selector: "form#signup", html: "<form id=\"signup\" novalidate>" };
+  const unannounced = byRule(formFindings(inspection({ unannouncedForms: found(form) })), "form-errors-not-announced");
+
+  assert.ok(unannounced);
+  assert.equal(unannounced.kind, "advisory");
+  assert.equal(unannounced.wcag[0].label, "4.1.3 Status Messages");
+  assert.match(unannounced.explanation, /screen reader to confirm/);
+});
+
+test("form counts are the true totals, while evidence stays bounded", () => {
+  const sample = Array.from({ length: 8 }, (_, index) => field(`f${index}`));
+  const invalid = byRule(formFindings(inspection({ invalidWithoutDescription: { count: 31, sample } })), "invalid-field-no-description");
+
+  assert.equal(invalid.count, 31);
+  assert.equal(invalid.occurrences.length, 4);
 });
 
 // ------------------------------------------------------------------- reflow

@@ -1,6 +1,6 @@
 # Clarity — Project Handoff
 
-Last updated: August 28, 2026 — the real scanner is connected; this is no longer a preview
+Last updated: September 28, 2026 — static form checks added
 
 This is the living source of truth for the Clarity accessibility-scanner project. Update it whenever product behavior, architecture, deployment, data, security, or priorities change.
 
@@ -80,7 +80,7 @@ No source credentials, access tokens, bypass tokens, API keys, or other secrets 
 Every finding carries two fields, and the report treats them as load-bearing:
 
 - `kind` — `violation` (maps to a WCAG 2.x A/AA success criterion) or `advisory` (axe best-practice; good hygiene, not a failure). **Only violations count toward the headline totals or the impact filters.** Advisories render in a separate, visually subordinate section that states plainly that they are not WCAG failures.
-- `detector` — `axe` today. `heuristic` (our own browser-driven checks) and `ai` (model-suggested, never asserted as measured fact) are the planned additions, and the report must keep them distinguishable from what axe actually measured.
+- `detector` — `axe`, or `heuristic` for our own browser-driven checks (keyboard, forms, reflow). `ai` (model-suggested, never asserted as measured fact) is still planned. The report must keep all three distinguishable from what axe actually measured.
 
 This split is the thing that makes it safe to add non-axe checks later. Without it, a heuristic guess and an axe measurement would look identical in the report, which is the failure mode this product exists to avoid. Do not collapse these fields, and do not let an advisory or a future AI suggestion into the headline numbers.
 
@@ -92,16 +92,19 @@ Advisories deliberately **do not go to the model**. They are lower stakes and mo
 
 1. **Desktop axe pass** at 1440×900 — the product's floor.
 2. **Keyboard walk** (`lib/scan/keyboard.ts`) — presses Tab for real, up to 60 times, recording where focus lands, then re-focuses each visited element to see whether its appearance changes at all. Produces `keyboard-trap`, `keyboard-trap-cycle`, `focus-on-hidden-element`, `focus-not-visible` (all violations) and `focus-order-jumps` (advisory). Runs before any resize so recorded positions match the desktop layout.
-3. **Mobile axe pass** at 390×844, merged with the desktop pass by rule id. A rule seen at both keeps the **higher** count, never the sum — they are two measurements of one page. Each finding carries `context`: "Desktop", "Mobile only", or "Desktop and mobile".
-4. **Reflow measurement** at 320 CSS px (`lib/scan/viewport.ts`) — the width a 1280px viewport reaches at 400% zoom. Horizontal overflow beyond an 8px scrollbar tolerance is a WCAG 1.4.10 violation, naming the outermost offending element.
+3. **Form checks** (`lib/scan/forms.ts`) — read-only inspection of how errors and required state reach assistive technology. Produces `invalid-field-no-description` (WCAG 3.3.1) and `required-not-programmatic` (1.3.1) as violations, and `error-message-not-linked` and `form-errors-not-announced` (4.1.3) as advisories. Runs after the keyboard walk on purpose: fields that validate on blur have been tabbed through and are showing their errors, which is as far as the scan can get without typing. **Nothing is ever typed or submitted.**
+4. **Mobile axe pass** at 390×844, merged with the desktop pass by rule id. A rule seen at both keeps the **higher** count, never the sum — they are two measurements of one page. Each finding carries `context`: "Desktop", "Mobile only", or "Desktop and mobile".
+5. **Reflow measurement** at 320 CSS px (`lib/scan/viewport.ts`) — the width a 1280px viewport reaches at 400% zoom. Horizontal overflow beyond an 8px scrollbar tolerance is a WCAG 1.4.10 violation, naming the outermost offending element.
 
-**Steps 2–4 are strictly best-effort.** Each has its own 20s budget, and a pass that throws or times out contributes nothing and logs why. The desktop axe results must never be lost because an extra check misbehaved — that is the whole reason they are separate passes rather than inline.
+**Steps 2–5 are strictly best-effort.** Each has its own 20s budget, and a pass that throws or times out contributes nothing and logs why. The desktop axe results must never be lost because an extra check misbehaved — that is the whole reason they are separate passes rather than inline.
 
 Because a caught error and a clean page both produce zero findings, every scan logs what each pass actually did:
 
 ```
 axe 6 rules desktop / 9 mobile | keyboard 60 stops of 1387 focusable | reflow 1187px in 320px
 ```
+
+That line predates the form checks, which now add `forms N fields` (visible fields inspected) after the keyboard entry.
 
 Without that line a silently broken detector is indistinguishable from a page with nothing wrong. Keep it.
 
@@ -120,7 +123,10 @@ Important files:
 - `app/page.tsx` — landing page and product explanation
 - `app/components/ScanForm.tsx` — URL validation and submission
 - `app/audits/[id]/page.tsx` — report route
-- `app/components/AuditReport.tsx` — progress, polling, failure states, and report UI
+- `app/components/AuditReport.tsx` — report page layout, summary, and impact filters
+- `app/components/useAuditPolling.ts` — polls the audit until it completes or fails
+- `app/components/ScanProgress.tsx` — progress and failure screens shown before a report exists
+- `app/components/FindingCard.tsx` — one rule group: evidence, fix, and copy buttons
 - `app/globals.css` — complete visual system and responsive behavior
 - `worker/index.ts` — API handling, URL guard, rate limiting, D1 persistence, and app dispatch
 - `lib/fixes/index.ts` — provider selection and per-group fallback; the only entry point callers need
@@ -128,11 +134,15 @@ Important files:
 - `lib/fixes/deterministic.ts` — axe/WCAG guidance used when no model is configured or a call fails
 - `lib/scan/index.ts` — the browser scan: navigation, request interception, redirect revalidation, axe injection, timeouts
 - `lib/scan/normalize.ts` — axe violations mapped onto the report shape, with all the bounds
+- `lib/scan/keyboard.ts` — the Tab walk and its findings
+- `lib/scan/forms.ts` — static form checks and their findings
+- `lib/scan/viewport.ts` — mobile merge and the 320px reflow measurement
 - `db/schema.ts` — normalized audit, issue-group, occurrence, and fix-suggestion models
 - `drizzle/` — generated D1 migrations packaged for hosting
 - `tests/rendered-html.test.mjs` — rendered-product smoke tests and deploy-config assertions
 - `tests/fix-provider.test.mjs` — HTTP contract against the built Worker bundle, plus fix-provider behaviour
 - `tests/normalize.test.mjs` — the axe-to-report mapping
+- `tests/heuristics.test.mjs` — keyboard, form, reflow, and viewport-merge findings
 - `public/og.png` — generated social preview card
 
 Removed on August 4 as unused scaffold: `app/chatgpt-auth.ts`, `public/file.svg`, `public/globe.svg`, `public/window.svg`. A test now asserts they stay deleted. Note that `app/chatgpt-auth.ts` was the only thing that could have gated access by ChatGPT identity — see the access-control note under "Hosting".
@@ -255,12 +265,13 @@ Clarity's central product claim is that it never overstates what it did. Three p
 4a. The keyboard walk stops at 60 Tab presses, so on a large page it covers only the first 60 stops — Wikipedia has 1387 focusable elements. A trap past that point is not detected.
 4b. The focus-indicator check compares computed styles on the element and its parent. An indicator drawn only via `::before`/`::after`, or on a distant ancestor, will be missed. It errs toward silence rather than false alarms.
 4c. Reflow is measured from `documentElement.scrollWidth`. A page using `overflow-x: hidden` clips its overflow instead of scrolling, so the measurement reads clean even though content is cut off.
+4d. Form checks see only the state the page is in after loading and one Tab pass. Errors that appear only after a submit are never observed — by design, see roadmap item 4. Error messages are recognised by `role="alert"` or an `error`/`invalid` class or id, so a message styled some other way is missed; that uncertainty is why `error-message-not-linked` is advisory.
 5. Some sites block automated browsers outright. The scan surfaces that as an honest `http_error` (a 403 from `w3.org` was seen during testing) rather than an empty report.
 6. No queue or retry dashboard yet. Worker observability is enabled in `wrangler.jsonc`.
 7. No scheduled cleanup physically deletes expired audits. A Workers cron trigger is the natural home for this.
 8. **There is no access control on the deployment.** The ChatGPT sign-in gate went away with OpenAI Sites. Put Cloudflare Access in front of the Worker before attaching a public domain, if it should stay private.
 9. Browser Rendering has a free-tier ceiling of 10 minutes of browser time per day and 3 concurrent browsers. At roughly 5–15s per scan that is comfortably above the three-per-hour submission limit, but it is a real ceiling — a busy day returns `browser_unavailable` failures, not fake results.
-10. The product intentionally excludes crawling, authentication, mobile viewports, screenshots, keyboard simulation, screen-reader testing, histories, billing, and automated code changes.
+10. The product intentionally excludes crawling, authentication, screenshots, screen-reader testing, interaction beyond pressing Tab (no clicking, typing, or form submission), histories, billing, and automated code changes. Mobile viewports and keyboard simulation used to be on this list; both were built on September 2, 2026.
 
 ## Recommended next build
 
@@ -284,7 +295,7 @@ Agreed order for widening what the auditor detects. The `kind`/`detector` split 
 1. ~~Keyboard and focus walk.~~ Done, September 2, 2026.
 2. ~~Second viewport and reflow.~~ Done, September 2, 2026. Text resize at 200% (SC 1.4.4) was **not** built — bumping font sizes and detecting clipping produces too many false positives to assert as a failure. The 320px reflow test covers the same ground more defensibly.
 3. **Fake interactive elements** (`detector: heuristic`) — an element with a click listener but no role, no tabindex, and `cursor: pointer` is a button that assistive technology cannot see. Detect via CDP `DOMDebugger.getEventListeners`; the model only writes the suggested label.
-4. **Static form-error plumbing** — `aria-describedby` wiring, `aria-live` regions, `aria-invalid`. **Do not submit forms on third-party sites** to observe dynamic errors: that can create accounts, send messages, or trigger purchases on pages we do not own. Static checks only.
+4. ~~Static form-error plumbing.~~ Done, September 28, 2026 — `aria-invalid` without described error text, asterisk-only required fields, error messages not referenced by their field, and `novalidate` forms on pages with no live region. The rule stands: **do not submit forms on third-party sites** to observe dynamic errors — that can create accounts, send messages, or trigger purchases on pages we do not own.
 5. **Accessible authentication (SC 3.3.8)** — paste blocked on password fields, missing `autocomplete="username"`/`"current-password"`, CAPTCHA present. Narrow, only fires on login pages, but nothing else reports it.
 6. **Vision alt-text review** (`detector: ai`) — last, behind a flag. Judging whether alt text is *meaningful* is the biggest quality gap, but it breaks the one-request-per-audit budget, and `image-alt` is deliberately always-manual-review because alt quality is human judgement. Ship as suggestions in the advisory tier, never as violations.
 
@@ -332,3 +343,6 @@ For every future change:
 - September 2, 2026 — Made the extra passes best-effort with their own budgets, and made every scan log what each pass did. A caught error and a clean page both yield zero findings; without the log line the two are indistinguishable, which would let a broken detector look like good news indefinitely.
 - September 2, 2026 — Merged the two viewports by taking the higher element count per rule rather than the sum. Ten contrast failures at desktop and fourteen at mobile are one page measured twice, not twenty-four problems; summing them would inflate the only number the report leads with.
 - September 2, 2026 — Filed tab-order reversals as `advisory`. Focus jumping up the page is often legitimate, and the reading order it implies is a judgement the scan cannot make. This is the first finding whose kind was chosen for honesty rather than severity, and it is the pattern later heuristics should follow.
+- September 28, 2026 — Added static form checks. Two are violations because they are measured: a field announced as invalid with no described error text (3.3.1), and an asterisk with no `required` or `aria-required` (1.3.1). Two are advisories because they are inferred: an error message recognised by class name, and a `novalidate` form with no live region, where only a submit would show whether focus moves to the errors. That follows the September 2 pattern of choosing the kind for honesty.
+- September 28, 2026 — Left `aria-errormessage` to axe and reported only broken `aria-describedby` wiring ourselves. axe checks `aria-errormessage` thoroughly, but it files a dangling `aria-describedby` as "needs review", which this scanner never collects; that was the gap.
+- September 28, 2026 — Ran the form checks after the keyboard walk rather than first. Many sites validate a field on blur, so the Tab pass surfaces real error states without typing or submitting anything. It is the only way to see an error message on a third-party page that stays inside the no-submission rule.

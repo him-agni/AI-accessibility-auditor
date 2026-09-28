@@ -13,6 +13,7 @@ import puppeteer from "@cloudflare/puppeteer";
 import axeSource from "axe-core/axe.min.js?raw";
 import { normalizeViolations } from "./normalize";
 import { walkFocusOrder, keyboardFindings } from "./keyboard";
+import { checkForms, formFindings } from "./forms";
 import { measureReflowAt, reflowFindings, mergeByViewport, DESKTOP_VIEWPORT, MOBILE_VIEWPORT } from "./viewport";
 import type { FindingInput } from "../fixes/types";
 
@@ -114,7 +115,7 @@ async function runScan(browser: Browser, targetUrl: string, isBlockedHostname: H
   const finalUrl = await navigate(page, targetUrl, isBlockedHostname);
   const desktop = await runDesktopAxe(page);
   const desktopFindings = normalizeViolations(desktop.violations);
-  const { keyboard, mobileFindings, reflow } = await runOptionalPasses(page, onWarning);
+  const { keyboard, forms, mobileFindings, reflow } = await runOptionalPasses(page, onWarning);
 
   // A pass that caught an error returns the same empty result as a clean page, so
   // say what each one actually did. Without this, a silently broken check is
@@ -122,6 +123,7 @@ async function runScan(browser: Browser, targetUrl: string, isBlockedHostname: H
   onWarning?.([
     `axe ${desktopFindings.length} rules desktop / ${mobileFindings.length} mobile`,
     keyboard ? `keyboard ${keyboard.steps.length} stops of ${keyboard.focusableCount} focusable` : "keyboard unavailable",
+    forms ? `forms ${forms.fieldCount} fields` : "forms unavailable",
     reflow ? `reflow ${reflow.scrollWidth}px in ${reflow.clientWidth}px` : "reflow unavailable",
   ].join(" | "));
 
@@ -129,6 +131,7 @@ async function runScan(browser: Browser, targetUrl: string, isBlockedHostname: H
     findings: [
       ...mergeByViewport(desktopFindings, mobileFindings),
       ...keyboardFindings(keyboard),
+      ...formFindings(forms),
       ...reflowFindings(reflow),
     ],
     finalUrl,
@@ -236,7 +239,7 @@ async function runDesktopAxe(page: Page) {
 }
 
 /**
- * Keyboard, mobile and reflow checks. All are additive: the desktop axe pass is the
+ * Keyboard, form, mobile and reflow checks. All are additive: the desktop axe pass is the
  * product's floor, and a pass that times out or throws contributes nothing and is
  * logged, but it must never cost the caller the results already in hand.
  */
@@ -253,6 +256,10 @@ async function runOptionalPasses(page: Page, onWarning?: Warn) {
   // Keyboard walk before any resize, so recorded positions match the desktop layout.
   const keyboard = await optional("keyboard walk", () => walkFocusOrder(page), null);
 
+  // After the walk: fields that validate on blur have now been tabbed through, so
+  // their errors are showing — the only error states reachable without typing.
+  const forms = await optional("form checks", () => checkForms(page), null);
+
   const mobileFindings = await optional("mobile pass", async () => {
     await page.setViewport(MOBILE_VIEWPORT);
     await wait(page, MOBILE_SETTLE_MS);
@@ -262,7 +269,7 @@ async function runOptionalPasses(page: Page, onWarning?: Warn) {
 
   const reflow = await optional("reflow pass", () => measureReflowAt(page), null);
 
-  return { keyboard, mobileFindings, reflow };
+  return { keyboard, forms, mobileFindings, reflow };
 }
 
 function navigationMessage(error: unknown) {

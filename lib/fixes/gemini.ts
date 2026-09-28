@@ -39,6 +39,7 @@ const ALWAYS_MANUAL_REVIEW = new Set([
   // Heuristic findings: we observed a symptom in one page state, and the right
   // remedy depends on intent the scan cannot see.
   "keyboard-trap", "keyboard-trap-cycle", "focus-on-hidden-element", "focus-not-visible", "focus-order-jumps",
+  "invalid-field-no-description", "required-not-programmatic", "error-message-not-linked", "form-errors-not-announced",
 ]);
 
 const RESPONSE_SCHEMA = {
