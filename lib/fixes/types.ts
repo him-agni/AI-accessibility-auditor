@@ -12,10 +12,9 @@ export type Confidence = "high" | "medium" | "low";
 export type FindingKind = "violation" | "advisory";
 
 /**
- * What produced the finding. Today everything comes from axe. `heuristic` (our own
- * browser-driven checks, e.g. the focus-order walk) and `ai` (model-suggested, never
- * asserted as fact) are the planned additions — the report must keep them visually
- * distinct from what axe actually measured.
+ * What produced the finding: `axe`, `heuristic` (our own browser-driven checks,
+ * e.g. the focus-order walk), or `ai` (model-suggested, never asserted as fact).
+ * The report must keep them visually distinct from what axe actually measured.
  */
 export type FindingDetector = "axe" | "heuristic" | "ai";
 
@@ -51,6 +50,20 @@ export type FixSuggestion = {
 };
 
 export type Finding = FindingInput & { fix: FixSuggestion };
+
+/**
+ * An image captured for the optional alt-text review. Held in memory for one audit
+ * and never stored: the screenshot is third-party page content.
+ */
+export type ImageSample = {
+  selector: string;
+  html: string;
+  alt: string;
+  /** Caption, link purpose, and nearby text, bounded. Untrusted page content. */
+  context: string;
+  /** JPEG, base64, at most 512px on its longest side. */
+  jpegBase64: string;
+};
 
 export interface FixProvider {
   readonly name: string;

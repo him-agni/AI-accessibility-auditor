@@ -1,7 +1,7 @@
 /** Cloudflare Worker entry point for Clarity. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
-import { buildFindings } from "../lib/fixes";
+import { altReviewEnabled, buildFindings, reviewAltText } from "../lib/fixes";
 import { scanPage, ScanError, type BrowserBinding } from "../lib/scan";
 
 interface Env {
@@ -13,6 +13,8 @@ interface Env {
   GEMINI_API_KEY?: string;
   /** Optional free-tier model override, e.g. "gemini-2.0-flash". */
   GEMINI_MODEL?: string;
+  /** "on" enables the AI alt-text review: a second model request per audit. */
+  ALT_TEXT_REVIEW?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -172,13 +174,15 @@ async function runAudit(env: Env, auditId: string, targetUrl: string) {
     await env.DB.prepare("UPDATE audits SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'")
       .bind(Date.now(), auditId).run();
 
-    const scan = await scanPage(targetUrl, env, isBlockedHostname, (warning) => log(warning));
+    const scan = await scanPage(targetUrl, env, isBlockedHostname, (warning) => log(warning), { captureImages: altReviewEnabled(env) });
 
     // Findings are real from here; only the remediation text is model-generated.
     await env.DB.prepare("UPDATE audits SET status = 'generating', final_url = ?, page_title = ?, axe_version = ? WHERE id = ?")
       .bind(scan.finalUrl, scan.pageTitle, scan.axeVersion, auditId).run();
 
-    const findings = await buildFindings(scan.findings, env, (message) => log(`fixes: ${message}`));
+    // Only when enabled; otherwise no images were captured and this returns nothing.
+    const altReview = await reviewAltText(scan.images, env, (message) => log(`alt review: ${message}`));
+    const findings = await buildFindings([...scan.findings, ...altReview], env, (message) => log(`fixes: ${message}`));
 
     await env.DB.prepare("UPDATE audits SET status = 'completed', report_json = ?, completed_at = ? WHERE id = ?")
       .bind(JSON.stringify(findings), Date.now(), auditId).run();

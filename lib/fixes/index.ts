@@ -44,6 +44,7 @@ export async function buildFindings(findings: FindingInput[], env: FixProviderEn
   }
 }
 
+export { altReviewEnabled, reviewAltText } from "./alt-review";
 export { deterministicFix } from "./deterministic";
 export { DEFAULT_GEMINI_MODEL } from "./gemini";
-export type { Confidence, Finding, FindingDetector, FindingInput, FindingKind, FixProvider, FixSuggestion, Impact, Occurrence, WcagReference } from "./types";
+export type { Confidence, Finding, FindingDetector, FindingInput, FindingKind, FixProvider, FixSuggestion, ImageSample, Impact, Occurrence, WcagReference } from "./types";

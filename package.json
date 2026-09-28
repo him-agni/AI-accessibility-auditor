@@ -9,7 +9,7 @@
     "dev": "vinext dev",
     "build": "vinext build",
     "start": "vinext start",
-    "test:build": "esbuild lib/fixes/index.ts lib/scan/normalize.ts lib/scan/keyboard.ts lib/scan/forms.ts lib/scan/viewport.ts --bundle --format=esm --platform=neutral --outdir=dist/test --out-extension:.js=.mjs",
+    "test:build": "esbuild lib/fixes/index.ts lib/scan/normalize.ts lib/scan/keyboard.ts lib/scan/forms.ts lib/scan/interactive.ts lib/scan/auth.ts lib/scan/images.ts lib/scan/viewport.ts --bundle --format=esm --platform=neutral --outdir=dist/test --out-extension:.js=.mjs",
     "test": "npm run build && npm run test:build && node --test tests/rendered-html.test.mjs tests/fix-provider.test.mjs tests/normalize.test.mjs tests/heuristics.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",

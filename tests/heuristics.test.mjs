@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-// The pure halves of the keyboard walk, form checks, and viewport passes, bundled from source.
+// The pure halves of the in-page checks and the viewport passes, bundled from source.
 const { keyboardFindings } = await import("../dist/test/scan/keyboard.mjs");
 const { reflowFindings, mergeByViewport } = await import("../dist/test/scan/viewport.mjs");
 const { formFindings } = await import("../dist/test/scan/forms.mjs");
+const { clickableFindings } = await import("../dist/test/scan/interactive.mjs");
+const { authFindings } = await import("../dist/test/scan/auth.mjs");
+const { imageFindings } = await import("../dist/test/scan/images.mjs");
 
 const step = (index, overrides = {}) => ({
   index,
@@ -159,6 +162,98 @@ test("form counts are the true totals, while evidence stays bounded", () => {
 
   assert.equal(invalid.count, 31);
   assert.equal(invalid.occurrences.length, 4);
+});
+
+// ------------------------------------------------------- fake interactive elements
+
+const control = (id, handler = "click listener") => ({ selector: `div#${id}`, html: `<div id="${id}">Save</div>`, handler });
+
+test("reports nothing when the clickable check failed or found no fake controls", () => {
+  assert.deepEqual(clickableFindings(null), []);
+  assert.deepEqual(clickableFindings({ candidateCount: 12, fakeControls: { count: 0, sample: [] } }), []);
+});
+
+test("a clickable div with no role or tabindex is a keyboard violation naming its handler", () => {
+  const [finding] = clickableFindings({ candidateCount: 12, fakeControls: { count: 2, sample: [control("save"), control("close", "React onClick")] } });
+
+  assert.equal(finding.ruleId, "fake-interactive-element");
+  assert.equal(finding.kind, "violation");
+  assert.equal(finding.detector, "heuristic");
+  assert.deepEqual(finding.wcag.map((reference) => reference.label), ["2.1.1 Keyboard", "4.1.2 Name, Role, Value"]);
+  assert.equal(finding.count, 2);
+  assert.match(finding.occurrences[1].failure, /React onClick/);
+});
+
+// ------------------------------------------------------- accessible authentication
+
+const authElement = (selector, note) => ({ selector, html: `<input ${selector}>`, note });
+const noAuth = () => ({ count: 0, sample: [] });
+const someAuth = (...elements) => ({ count: elements.length, sample: elements });
+const signIn = (overrides = {}) => ({
+  passwordFields: 1,
+  pasteBlocked: noAuth(),
+  autocompleteMissing: noAuth(),
+  captchas: noAuth(),
+  ...overrides,
+});
+
+test("sign-in checks report nothing on pages without a password field", () => {
+  assert.deepEqual(authFindings(null), []);
+  assert.deepEqual(authFindings(signIn({ passwordFields: 0, pasteBlocked: someAuth(authElement("input#pw", "blocked")) })), []);
+  assert.deepEqual(authFindings(signIn()), []);
+});
+
+test("blocked paste on a password field is a 3.3.8 violation", () => {
+  const blocked = byRule(authFindings(signIn({ pasteBlocked: someAuth(authElement("input#pw", "Pasting into this field is cancelled by the page.")) })), "auth-paste-blocked");
+
+  assert.ok(blocked);
+  assert.equal(blocked.kind, "violation");
+  assert.equal(blocked.wcag[0].label, "3.3.8 Accessible Authentication (Minimum)");
+  assert.equal(blocked.occurrences[0].failure, "Pasting into this field is cancelled by the page.");
+});
+
+test("missing autocomplete hints and CAPTCHAs are advisories, not asserted failures", () => {
+  const findings = authFindings(signIn({
+    autocompleteMissing: someAuth(authElement("input#email", "Username field has no autocomplete attribute; expected \"username\".")),
+    captchas: someAuth(authElement("div.g-recaptcha", "reCAPTCHA challenge on a sign-in page.")),
+  }));
+
+  assert.equal(byRule(findings, "auth-autocomplete-missing").kind, "advisory");
+  assert.equal(byRule(findings, "auth-captcha").kind, "advisory");
+  assert.equal(byRule(findings, "auth-paste-blocked"), undefined);
+});
+
+// ------------------------------------------------------------ placeholder alt text
+
+const image = (alt, src = "https://example.com/assets/team.jpg") => ({
+  selector: "img.hero", html: `<img alt="${alt}">`, alt, src, context: "", x: 0, y: 0, width: 400, height: 300,
+});
+const placeholderFailures = (...images) => imageFindings({ images, samples: [] })[0]?.occurrences.map((occurrence) => occurrence.failure) ?? [];
+
+test("flags file names, camera names, IDs and generic words used as alt text", () => {
+  const [finding] = imageFindings({ images: [image("IMG_0042.jpg"), image("DSC01234"), image("48213"), image("logo")], samples: [] });
+
+  assert.equal(finding.ruleId, "alt-text-placeholder");
+  assert.equal(finding.kind, "violation");
+  assert.equal(finding.wcag[0].label, "1.1.1 Non-text Content");
+  assert.equal(finding.count, 4);
+  assert.match(finding.occurrences[0].failure, /is a file name/);
+  assert.match(finding.occurrences[1].failure, /camera or screenshot file name/);
+  assert.match(finding.occurrences[2].failure, /number or ID/);
+  assert.match(finding.occurrences[3].failure, /generic word "logo"/);
+});
+
+test("flags alt text that repeats a machine-made file name", () => {
+  assert.match(placeholderFailures(image("team-photo-2", "https://example.com/team-photo-2.webp?w=800"))[0], /repeats the image's file name/);
+});
+
+test("leaves real descriptions alone, including a brand name that matches its file", () => {
+  assert.deepEqual(placeholderFailures(
+    image("Acme", "https://example.com/acme.png"),
+    image("Volunteers planting trees along the river path"),
+    image("Photo of the 2024 team offsite"),
+  ), []);
+  assert.deepEqual(imageFindings(null), []);
 });
 
 // ------------------------------------------------------------------- reflow

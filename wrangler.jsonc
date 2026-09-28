@@ -39,7 +39,7 @@
     "enabled": true
   }
 
-  // GEMINI_API_KEY and GEMINI_MODEL are NOT declared here. Set them with
+  // GEMINI_API_KEY, GEMINI_MODEL and ALT_TEXT_REVIEW are NOT declared here. Set them with
   // `wrangler secret put GEMINI_API_KEY`, or locally in the gitignored `.dev.vars`.
   // Never commit a key.
 }

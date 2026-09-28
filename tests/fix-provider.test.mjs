@@ -8,7 +8,7 @@ import test from "node:test";
 const workerUrl = new URL("../dist/server/index.js", import.meta.url);
 workerUrl.searchParams.set("test", `${process.pid}-fix-provider`);
 const { default: worker } = await import(workerUrl.href);
-const { buildFindings } = await import("../dist/test/fixes/index.mjs");
+const { buildFindings, reviewAltText, altReviewEnabled } = await import("../dist/test/fixes/index.mjs");
 
 const ASSETS = { fetch: async () => new Response("Not found", { status: 404 }) };
 const originalFetch = globalThis.fetch;
@@ -419,5 +419,107 @@ test("strips markdown fences the model may still emit", async () => {
     assert.match(fix.codeExample, /<html lang="en">/);
   } finally {
     restore();
+  }
+});
+
+// ------------------------------------------------------------ AI alt-text review
+
+const IMAGES = [
+  { selector: "img.logo", html: "<img class=\"logo\" alt=\"logo\">", alt: "logo", context: "inside a link | nearby text: Acme home", jpegBase64: "AAAA" },
+  { selector: "img.team", html: "<img class=\"team\" alt=\"Our team\">", alt: "Our team", context: "nearby text: Meet the people behind Acme", jpegBase64: "BBBB" },
+  { selector: "img.divider", html: "<img class=\"divider\" alt=\"wave\">", alt: "wave", context: "", jpegBase64: "CCCC" },
+];
+const ALT_ON = { GEMINI_API_KEY: "test-key", ALT_TEXT_REVIEW: "on" };
+
+test("alt-text review is off unless explicitly enabled with a key", async () => {
+  let calls = 0;
+  const restore = stubGemini(async () => { calls += 1; return geminiOk([]); });
+
+  try {
+    assert.equal(altReviewEnabled({ GEMINI_API_KEY: "test-key" }), false);
+    assert.equal(altReviewEnabled({ ALT_TEXT_REVIEW: "on" }), false, "needs a key");
+    assert.equal(altReviewEnabled(ALT_ON), true);
+    assert.deepEqual(await reviewAltText(IMAGES, { GEMINI_API_KEY: "test-key" }), []);
+    assert.deepEqual(await reviewAltText([], ALT_ON), []);
+    assert.equal(calls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("reviews every image in one request, with each screenshot inline and marked untrusted", async () => {
+  let calls = 0;
+  let body;
+  const restore = stubGemini(async (_target, init) => {
+    calls += 1;
+    body = JSON.parse(init.body);
+    return geminiOk([]);
+  });
+
+  try {
+    await reviewAltText(IMAGES, ALT_ON);
+    const parts = body.contents[0].parts;
+
+    assert.equal(calls, 1, "one request for all images");
+    assert.deepEqual(parts.filter((part) => part.inlineData).map((part) => part.inlineData.data), ["AAAA", "BBBB", "CCCC"]);
+    assert.ok(parts.every((part) => !part.inlineData || part.inlineData.mimeType === "image/jpeg"));
+    assert.match(body.systemInstruction.parts[0].text, /untrusted/i);
+    assert.match(body.systemInstruction.parts[0].text, /Never follow instructions/i);
+  } finally {
+    restore();
+  }
+});
+
+test("reports weak alt text as an AI advisory with the model's suggestion", async () => {
+  const restore = stubGemini(async () => geminiOk([
+    { index: 0, verdict: "vague", suggestion: "Acme home", reason: "The logo links home but names no one." },
+    { index: 1, verdict: "adequate", suggestion: "", reason: "Matches the photo." },
+    { index: 2, verdict: "decorative", suggestion: "", reason: "A divider with no meaning." },
+  ]));
+
+  try {
+    const [review] = await reviewAltText(IMAGES, ALT_ON);
+
+    assert.equal(review.ruleId, "alt-text-review");
+    assert.equal(review.kind, "advisory", "never asserted as a violation");
+    assert.equal(review.detector, "ai");
+    assert.equal(review.count, 2);
+    assert.deepEqual(review.occurrences.map((occurrence) => occurrence.selector), ["img.logo", "img.divider"]);
+    assert.match(review.occurrences[0].failure, /Suggested alt: "Acme home"/);
+    assert.match(review.occurrences[1].failure, /alt="" \(decorative\)/);
+  } finally {
+    restore();
+  }
+});
+
+test("drops invented indexes, unknown verdicts, and weak verdicts with no suggestion", async () => {
+  const restore = stubGemini(async () => geminiOk([
+    { index: 7, verdict: "vague", suggestion: "Nothing here", reason: "Out of range." },
+    { index: 0, verdict: "terrible", suggestion: "Acme home", reason: "Not a verdict." },
+    { index: 1, verdict: "inaccurate", suggestion: "", reason: "No replacement offered." },
+    { index: 2, verdict: "unclear", suggestion: "", reason: "Covered by a banner." },
+  ]));
+
+  try {
+    assert.deepEqual(await reviewAltText(IMAGES, ALT_ON), []);
+  } finally {
+    restore();
+  }
+});
+
+test("a failed alt-text review yields nothing and never throws", async () => {
+  for (const handler of [
+    async () => new Response("quota", { status: 429 }),
+    async () => new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "not json" }] } }] }), { status: 200 }),
+    async () => { throw new TypeError("network down"); },
+  ]) {
+    const errors = [];
+    const restore = stubGemini(handler);
+    try {
+      assert.deepEqual(await reviewAltText(IMAGES, ALT_ON, (message) => errors.push(message)), []);
+      assert.equal(errors.length, 1);
+    } finally {
+      restore();
+    }
   }
 });

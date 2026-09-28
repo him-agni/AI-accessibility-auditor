@@ -12,18 +12,28 @@ import puppeteer from "@cloudflare/puppeteer";
 // executed inside the Worker itself — only in the isolated browser tab.
 import axeSource from "axe-core/axe.min.js?raw";
 import { normalizeViolations } from "./normalize";
-import { walkFocusOrder, keyboardFindings } from "./keyboard";
-import { checkForms, formFindings } from "./forms";
-import { measureReflowAt, reflowFindings, mergeByViewport, DESKTOP_VIEWPORT, MOBILE_VIEWPORT } from "./viewport";
-import type { FindingInput } from "../fixes/types";
+import { walkFocusOrder, keyboardFindings, type KeyboardWalk } from "./keyboard";
+import { checkForms, formFindings, type FormInspection } from "./forms";
+import { findFakeControls, clickableFindings, type ClickableInspection } from "./interactive";
+import { checkAuthentication, authFindings, type AuthInspection } from "./auth";
+import { inspectImages, imageFindings, type ImageInspection } from "./images";
+import { measureReflowAt, reflowFindings, mergeByViewport, DESKTOP_VIEWPORT, MOBILE_VIEWPORT, type ReflowResult } from "./viewport";
+import type { FindingInput, ImageSample } from "../fixes/types";
 
 /** The Browser Rendering binding, as `puppeteer.launch` expects it. */
 export type BrowserBinding = Parameters<typeof puppeteer.launch>[0];
 
 export type ScanEnv = { BROWSER?: BrowserBinding };
 
+export type ScanOptions = {
+  /** Screenshot images for the AI alt-text review. Off unless that review is enabled. */
+  captureImages?: boolean;
+};
+
 export type ScanResult = {
   findings: FindingInput[];
+  /** Screenshots for the alt-text review; empty unless requested. Never stored. */
+  images: ImageSample[];
   finalUrl: string;
   pageTitle: string;
   axeVersion: string;
@@ -43,6 +53,8 @@ const NAVIGATION_TIMEOUT_MS = 25_000;
 const AXE_TIMEOUT_MS = 30_000;
 /** Each optional pass gets its own budget; overrunning one costs only that pass. */
 const EXTRA_PASS_TIMEOUT_MS = 20_000;
+/** All optional passes together. Axe (30s) plus this stays under the job ceiling. */
+const OPTIONAL_PASSES_BUDGET_MS = 45_000;
 /** Ceiling for the whole job, so one page can never hold a browser session open. */
 const TOTAL_JOB_TIMEOUT_MS = 90_000;
 const VIEWPORT = DESKTOP_VIEWPORT;
@@ -92,6 +104,7 @@ export async function scanPage(
   env: ScanEnv,
   isBlockedHostname: HostnameGuard,
   onWarning?: Warn,
+  options: ScanOptions = {},
 ): Promise<ScanResult> {
   if (!env.BROWSER) throw new ScanError("browser_unavailable", "The scanner is not available right now.");
 
@@ -99,7 +112,7 @@ export async function scanPage(
 
   try {
     return await withTimeout(
-      runScan(browser, targetUrl, isBlockedHostname, onWarning),
+      runScan(browser, targetUrl, isBlockedHostname, options, onWarning),
       TOTAL_JOB_TIMEOUT_MS,
       "scan_timeout",
       "This page took too long to scan.",
@@ -110,30 +123,18 @@ export async function scanPage(
   }
 }
 
-async function runScan(browser: Browser, targetUrl: string, isBlockedHostname: HostnameGuard, onWarning?: Warn): Promise<ScanResult> {
+async function runScan(browser: Browser, targetUrl: string, isBlockedHostname: HostnameGuard, options: ScanOptions, onWarning?: Warn): Promise<ScanResult> {
   const page = await openGuardedPage(browser, isBlockedHostname, onWarning);
   const finalUrl = await navigate(page, targetUrl, isBlockedHostname);
   const desktop = await runDesktopAxe(page);
   const desktopFindings = normalizeViolations(desktop.violations);
-  const { keyboard, forms, mobileFindings, reflow } = await runOptionalPasses(page, onWarning);
+  const passes = await runOptionalPasses(page, options, onWarning);
 
-  // A pass that caught an error returns the same empty result as a clean page, so
-  // say what each one actually did. Without this, a silently broken check is
-  // indistinguishable from a page with nothing wrong.
-  onWarning?.([
-    `axe ${desktopFindings.length} rules desktop / ${mobileFindings.length} mobile`,
-    keyboard ? `keyboard ${keyboard.steps.length} stops of ${keyboard.focusableCount} focusable` : "keyboard unavailable",
-    forms ? `forms ${forms.fieldCount} fields` : "forms unavailable",
-    reflow ? `reflow ${reflow.scrollWidth}px in ${reflow.clientWidth}px` : "reflow unavailable",
-  ].join(" | "));
+  onWarning?.([`axe ${desktopFindings.length} rules desktop / ${passes.mobileFindings.length} mobile`, ...passes.summaries].join(" | "));
 
   return {
-    findings: [
-      ...mergeByViewport(desktopFindings, mobileFindings),
-      ...keyboardFindings(keyboard),
-      ...formFindings(forms),
-      ...reflowFindings(reflow),
-    ],
+    findings: [...mergeByViewport(desktopFindings, passes.mobileFindings), ...passes.findings],
+    images: passes.images,
     finalUrl,
     pageTitle: desktop.title.trim().slice(0, 200) || new URL(finalUrl).hostname,
     axeVersion: desktop.version || "4.x",
@@ -238,15 +239,48 @@ async function runDesktopAxe(page: Page) {
   };
 }
 
+type PassResults = {
+  keyboard: KeyboardWalk | null;
+  forms: FormInspection | null;
+  clickable: ClickableInspection | null;
+  auth: AuthInspection | null;
+  images: ImageInspection | null;
+  reflow: ReflowResult | null;
+};
+
 /**
- * Keyboard, form, mobile and reflow checks. All are additive: the desktop axe pass is the
- * product's floor, and a pass that times out or throws contributes nothing and is
- * logged, but it must never cost the caller the results already in hand.
+ * A pass that caught an error returns the same empty result as a clean page, so
+ * say what each one actually did. Without this, a silently broken check is
+ * indistinguishable from a page with nothing wrong.
  */
-async function runOptionalPasses(page: Page, onWarning?: Warn) {
+function passSummaries({ keyboard, forms, clickable, auth, images, reflow }: PassResults) {
+  return [
+    keyboard ? `keyboard ${keyboard.steps.length} stops of ${keyboard.focusableCount} focusable` : "keyboard unavailable",
+    forms ? `forms ${forms.fieldCount} fields` : "forms unavailable",
+    clickable ? `clickable ${clickable.fakeControls.count} of ${clickable.candidateCount} pointer elements` : "clickable unavailable",
+    auth ? `sign-in ${auth.passwordFields} password fields` : "sign-in unavailable",
+    images ? `images ${images.images.length} with alt, ${images.samples.length} captured` : "images unavailable",
+    reflow ? `reflow ${reflow.scrollWidth}px in ${reflow.clientWidth}px` : "reflow unavailable",
+  ];
+}
+
+/**
+ * Keyboard, form, clickable, sign-in, image, mobile and reflow checks. All are
+ * additive: the desktop axe pass is the product's floor, and a pass that times out
+ * or throws contributes nothing and is logged, but it must never cost the caller
+ * the results already in hand. They share one budget, so together they can never
+ * push the job past its own ceiling and fail the scan.
+ */
+async function runOptionalPasses(page: Page, options: ScanOptions, onWarning?: Warn) {
+  const deadline = Date.now() + OPTIONAL_PASSES_BUDGET_MS;
   const optional = async <T>(label: string, run: () => Promise<T>, empty: T): Promise<T> => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      onWarning?.(`${label} skipped: out of time`);
+      return empty;
+    }
     try {
-      return await withTimeout(run(), EXTRA_PASS_TIMEOUT_MS, "pass_timeout", `${label} timed out`);
+      return await withTimeout(run(), Math.min(EXTRA_PASS_TIMEOUT_MS, remaining), "pass_timeout", `${label} timed out`);
     } catch (error) {
       onWarning?.(`${label} skipped: ${error instanceof Error ? error.message : "failed"}`);
       return empty;
@@ -255,10 +289,13 @@ async function runOptionalPasses(page: Page, onWarning?: Warn) {
 
   // Keyboard walk before any resize, so recorded positions match the desktop layout.
   const keyboard = await optional("keyboard walk", () => walkFocusOrder(page), null);
-
   // After the walk: fields that validate on blur have now been tabbed through, so
   // their errors are showing — the only error states reachable without typing.
   const forms = await optional("form checks", () => checkForms(page), null);
+  const clickable = await optional("clickable check", () => findFakeControls(page), null);
+  // Dispatches a synthetic paste, so it runs after the read-only passes.
+  const auth = await optional("sign-in checks", () => checkAuthentication(page), null);
+  const images = await optional("image checks", () => inspectImages(page, options.captureImages ?? false), null);
 
   const mobileFindings = await optional("mobile pass", async () => {
     await page.setViewport(MOBILE_VIEWPORT);
@@ -269,7 +306,19 @@ async function runOptionalPasses(page: Page, onWarning?: Warn) {
 
   const reflow = await optional("reflow pass", () => measureReflowAt(page), null);
 
-  return { keyboard, forms, mobileFindings, reflow };
+  return {
+    mobileFindings,
+    images: images?.samples ?? [],
+    summaries: passSummaries({ keyboard, forms, clickable, auth, images, reflow }),
+    findings: [
+      ...keyboardFindings(keyboard),
+      ...formFindings(forms),
+      ...clickableFindings(clickable),
+      ...authFindings(auth),
+      ...imageFindings(images),
+      ...reflowFindings(reflow),
+    ],
+  };
 }
 
 function navigationMessage(error: unknown) {

@@ -7,3 +7,7 @@
 GEMINI_API_KEY=
 # Optional. Defaults to gemini-2.5-flash. Any free-tier text model works.
 GEMINI_MODEL=gemini-2.5-flash
+# Optional. "on" sends up to six image screenshots per audit to Gemini to review
+# their alt text: a second model request per audit. Needs GEMINI_API_KEY and a
+# vision-capable model (gemini-2.5-flash is).
+ALT_TEXT_REVIEW=

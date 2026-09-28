@@ -1,6 +1,6 @@
 # Clarity — Project Handoff
 
-Last updated: September 28, 2026 — static form checks added
+Last updated: September 28, 2026 — clickable-element, sign-in, and alt-text checks added
 
 This is the living source of truth for the Clarity accessibility-scanner project. Update it whenever product behavior, architecture, deployment, data, security, or priorities change.
 
@@ -86,17 +86,20 @@ This split is the thing that makes it safe to add non-axe checks later. Without 
 
 axe runs with `best-practice` alongside the WCAG tags, so all 105 of its rules execute; `normalize` splits them by tag. Group counts are capped per kind (25 violations, 15 advisories) so a flood of advisories can never push a real failure out of the report.
 
-Advisories deliberately **do not go to the model**. They are lower stakes and more numerous, and including them would grow the prompt without changing what a team fixes first, so they always take deterministic guidance. An audit therefore stays at exactly one model request no matter how many best-practice notes a page produces.
+Advisories deliberately **do not go to the model**. They are lower stakes and more numerous, and including them would grow the prompt without changing what a team fixes first, so they always take deterministic guidance. An audit therefore stays at exactly one model request no matter how many best-practice notes a page produces. The one exception is opt-in: with `ALT_TEXT_REVIEW` on, the alt-text review makes a second request of its own — see "Fix generation".
 
 ### What a scan does, in order
 
 1. **Desktop axe pass** at 1440×900 — the product's floor.
 2. **Keyboard walk** (`lib/scan/keyboard.ts`) — presses Tab for real, up to 60 times, recording where focus lands, then re-focuses each visited element to see whether its appearance changes at all. Produces `keyboard-trap`, `keyboard-trap-cycle`, `focus-on-hidden-element`, `focus-not-visible` (all violations) and `focus-order-jumps` (advisory). Runs before any resize so recorded positions match the desktop layout.
 3. **Form checks** (`lib/scan/forms.ts`) — read-only inspection of how errors and required state reach assistive technology. Produces `invalid-field-no-description` (WCAG 3.3.1) and `required-not-programmatic` (1.3.1) as violations, and `error-message-not-linked` and `form-errors-not-announced` (4.1.3) as advisories. Runs after the keyboard walk on purpose: fields that validate on blur have been tabbed through and are showing their errors, which is as far as the scan can get without typing. **Nothing is ever typed or submitted.**
-4. **Mobile axe pass** at 390×844, merged with the desktop pass by rule id. A rule seen at both keeps the **higher** count, never the sum — they are two measurements of one page. Each finding carries `context`: "Desktop", "Mobile only", or "Desktop and mobile".
-5. **Reflow measurement** at 320 CSS px (`lib/scan/viewport.ts`) — the width a 1280px viewport reaches at 400% zoom. Horizontal overflow beyond an 8px scrollbar tolerance is a WCAG 1.4.10 violation, naming the outermost offending element.
+4. **Clickable-element check** (`lib/scan/interactive.ts`) — finds elements with a pointer cursor and a click handler but no role and no tabindex: things that work as buttons for a mouse and not at all for a keyboard. Handlers are found three ways, because frameworks attach them differently: DevTools `DOMDebugger.getEventListeners` for anything added with `addEventListener` (plain JS, Vue, Angular, Svelte, Preact), React's `__reactProps$…` and Solid's `$$click` on the node for libraries that delegate to the root, and the `onclick` property for inline handlers. Produces `fake-interactive-element` (WCAG 2.1.1 and 4.1.2) as a violation.
+5. **Sign-in checks** (`lib/scan/auth.ts`) — only on pages with a visible password field. Dispatches a synthetic, empty `paste` event at each password field and records whether the page cancels it: `auth-paste-blocked` (3.3.8) is a violation. Missing `autocomplete="username"` / `"current-password"` (`auth-autocomplete-missing`) and a CAPTCHA on the page (`auth-captcha`) are advisories. Runs after the read-only passes because it dispatches an event.
+6. **Image checks** (`lib/scan/images.ts`) — alt text that is a file name, a camera or screenshot name, a bare number, or a placeholder word such as "image" or "logo" is `alt-text-placeholder`, a 1.1.1 violation (WCAG failure technique F30), with no model involved. When `ALT_TEXT_REVIEW` is on, this pass also screenshots up to six images for the AI review; see "Fix generation".
+7. **Mobile axe pass** at 390×844, merged with the desktop pass by rule id. A rule seen at both keeps the **higher** count, never the sum — they are two measurements of one page. Each finding carries `context`: "Desktop", "Mobile only", or "Desktop and mobile".
+8. **Reflow measurement** at 320 CSS px (`lib/scan/viewport.ts`) — the width a 1280px viewport reaches at 400% zoom. Horizontal overflow beyond an 8px scrollbar tolerance is a WCAG 1.4.10 violation, naming the outermost offending element.
 
-**Steps 2–5 are strictly best-effort.** Each has its own 20s budget, and a pass that throws or times out contributes nothing and logs why. The desktop axe results must never be lost because an extra check misbehaved — that is the whole reason they are separate passes rather than inline.
+**Steps 2–8 are strictly best-effort.** Each has its own 20s budget, and a pass that throws or times out contributes nothing and logs why. Together they share a 45s budget, so they can never push the job past its 90s ceiling and fail the scan; a pass that finds no time left is skipped and logged. The desktop axe results must never be lost because an extra check misbehaved — that is the whole reason they are separate passes rather than inline.
 
 Because a caught error and a clean page both produce zero findings, every scan logs what each pass actually did:
 
@@ -104,7 +107,7 @@ Because a caught error and a clean page both produce zero findings, every scan l
 axe 6 rules desktop / 9 mobile | keyboard 60 stops of 1387 focusable | reflow 1187px in 320px
 ```
 
-That line predates the form checks, which now add `forms N fields` (visible fields inspected) after the keyboard entry.
+That line predates the later passes, which now add `forms N fields`, `clickable N of M pointer elements`, `sign-in N password fields`, and `images N with alt, M captured` after the keyboard entry.
 
 Without that line a silently broken detector is indistinguishable from a page with nothing wrong. Keep it.
 
@@ -132,17 +135,21 @@ Important files:
 - `lib/fixes/index.ts` — provider selection and per-group fallback; the only entry point callers need
 - `lib/fixes/gemini.ts` — Gemini request, response schema, output validation, injection guard
 - `lib/fixes/deterministic.ts` — axe/WCAG guidance used when no model is configured or a call fails
+- `lib/fixes/alt-review.ts` — the opt-in AI alt-text review
 - `lib/scan/index.ts` — the browser scan: navigation, request interception, redirect revalidation, axe injection, timeouts
 - `lib/scan/normalize.ts` — axe violations mapped onto the report shape, with all the bounds
 - `lib/scan/keyboard.ts` — the Tab walk and its findings
 - `lib/scan/forms.ts` — static form checks and their findings
+- `lib/scan/interactive.ts` — clickable elements that are not controls, via DevTools listeners and framework props
+- `lib/scan/auth.ts` — sign-in checks for WCAG 3.3.8
+- `lib/scan/images.ts` — placeholder alt text, and screenshots for the AI review
 - `lib/scan/viewport.ts` — mobile merge and the 320px reflow measurement
 - `db/schema.ts` — normalized audit, issue-group, occurrence, and fix-suggestion models
 - `drizzle/` — generated D1 migrations packaged for hosting
 - `tests/rendered-html.test.mjs` — rendered-product smoke tests and deploy-config assertions
 - `tests/fix-provider.test.mjs` — HTTP contract against the built Worker bundle, plus fix-provider behaviour
 - `tests/normalize.test.mjs` — the axe-to-report mapping
-- `tests/heuristics.test.mjs` — keyboard, form, reflow, and viewport-merge findings
+- `tests/heuristics.test.mjs` — findings from every heuristic pass, plus viewport merging
 - `public/og.png` — generated social preview card
 
 Removed on August 4 as unused scaffold: `app/chatgpt-auth.ts`, `public/file.svg`, `public/globe.svg`, `public/window.svg`. A test now asserts they stay deleted. Note that `app/chatgpt-auth.ts` was the only thing that could have gated access by ChatGPT identity — see the access-control note under "Hosting".
@@ -168,10 +175,21 @@ Statuses are `queued | running | generating | completed | failed`. `generating` 
 
 One model request covers an entire audit — all rule groups in a single call, never one per group. The free Gemini tier is limited per minute and per day, so this matters. A poller that reaches the completion transition claims it with a conditional `UPDATE` to `generating`; losers keep polling instead of spending a second request.
 
-Configuration, both optional:
+Configuration, all optional:
 
 - `GEMINI_API_KEY` — Google AI Studio key. Absent is a supported state, not an error.
-- `GEMINI_MODEL` — defaults to `gemini-2.5-flash`. Any free-tier text model works.
+- `GEMINI_MODEL` — defaults to `gemini-2.5-flash`. Any free-tier text model works; the alt-text review needs one that accepts images, which `gemini-2.5-flash` does.
+- `ALT_TEXT_REVIEW` — `on` enables the AI alt-text review below. Off by default.
+
+### AI alt-text review (`lib/fixes/alt-review.ts`)
+
+The one place a model judges the page rather than only writing fixes, so it runs under the strictest rules in the product:
+
+- **Opt-in.** It is a second model request per audit, and the free tier is limited per minute and per day. Without `ALT_TEXT_REVIEW=on` and a key, no screenshots are taken and no request is made.
+- **Advisory only.** Findings are `alt-text-review`, `kind: advisory`, `detector: ai`. They never count toward the totals, and the report labels them "AI suggestion — verify before acting".
+- **Screenshots, not URLs.** Up to six images — placeholders first, then the largest — are screenshotted from the rendered page, downscaled to 512px, and sent inline. The Worker never fetches an image URL itself, because that would bypass the request guard every browser request goes through. Screenshots live in memory for one audit and are never stored.
+- **Untrusted input both ways.** Alt text, surrounding text, and any words inside the images are marked as data the model must not obey. Its answers are re-validated: an out-of-range index, an unknown verdict, or a "vague" or "inaccurate" verdict with no replacement text is dropped.
+- **Fails quietly.** Any error yields no AI findings and never delays or fails the report.
 
 Set these as Worker environment values. Locally, copy `.dev.vars.example` to `.dev.vars`, which is gitignored. Never commit a key.
 
@@ -261,17 +279,20 @@ Clarity's central product claim is that it never overstates what it did. Three p
 1. **The scan has not been exercised against the deployed Browser Rendering service** — only against the local Chromium `wrangler dev` provides. Remote behaviour (cold starts, session acquisition, concurrency limits) is unverified. Confirm after the first deploy.
 2. The Gemini path has not been exercised against the live API; it is verified only against a stubbed endpoint. Confirm with a real key before relying on it.
 3. **DNS rebinding is not addressed.** Every request the page makes is re-validated by hostname (`page.on("request")`), and the landed URL is re-checked after redirects, but a hostname that resolves to a private address still passes — the guard never sees resolved IPs. Cloudflare's browser runs outside our network, which limits the blast radius, but this is the remaining gap in the URL-guard story.
-4. Only one page state is scanned: aside from pressing Tab, there is no interaction, no scrolling, and no dismissing of cookie banners. A page that renders its real content only after consent will be scanned in its pre-consent state.
+4. Only one page state is scanned: aside from pressing Tab and one synthetic paste event on password fields, there is no interaction, no scrolling, and no dismissing of cookie banners. A page that renders its real content only after consent will be scanned in its pre-consent state.
 4a. The keyboard walk stops at 60 Tab presses, so on a large page it covers only the first 60 stops — Wikipedia has 1387 focusable elements. A trap past that point is not detected.
 4b. The focus-indicator check compares computed styles on the element and its parent. An indicator drawn only via `::before`/`::after`, or on a distant ancestor, will be missed. It errs toward silence rather than false alarms.
 4c. Reflow is measured from `documentElement.scrollWidth`. A page using `overflow-x: hidden` clips its overflow instead of scrolling, so the measurement reads clean even though content is cut off.
 4d. Form checks see only the state the page is in after loading and one Tab pass. Errors that appear only after a submit are never observed — by design, see roadmap item 4. Error messages are recognised by `role="alert"` or an `error`/`invalid` class or id, so a message styled some other way is missed; that uncertainty is why `error-message-not-linked` is advisory.
+4e. The clickable check cannot see a handler delegated by hand to a shared ancestor, as in jQuery's `$(document).on("click", ".x")`, so those fake buttons are missed. It checks at most 120 pointer-cursor elements, and only the outermost of a pointer region, because `cursor` inherits.
+4f. The sign-in paste test uses a synthetic event. A page that blocks paste some other way — clearing the field afterwards, say — reads as allowing it. CAPTCHAs are recognised by vendor markup and `captcha` in names; a custom one named otherwise is missed. reCAPTCHA v3 and Cloudflare Turnstile show no challenge and are deliberately not reported.
+4g. The AI alt-text review sees at most six images per audit, and a screenshot of an image under a cookie banner shows the banner; the model is told to answer "unclear" then, and those verdicts are dropped. **It has not been exercised against the live Gemini API** — only a stub.
 5. Some sites block automated browsers outright. The scan surfaces that as an honest `http_error` (a 403 from `w3.org` was seen during testing) rather than an empty report.
 6. No queue or retry dashboard yet. Worker observability is enabled in `wrangler.jsonc`.
 7. No scheduled cleanup physically deletes expired audits. A Workers cron trigger is the natural home for this.
 8. **There is no access control on the deployment.** The ChatGPT sign-in gate went away with OpenAI Sites. Put Cloudflare Access in front of the Worker before attaching a public domain, if it should stay private.
 9. Browser Rendering has a free-tier ceiling of 10 minutes of browser time per day and 3 concurrent browsers. At roughly 5–15s per scan that is comfortably above the three-per-hour submission limit, but it is a real ceiling — a busy day returns `browser_unavailable` failures, not fake results.
-10. The product intentionally excludes crawling, authentication, screenshots, screen-reader testing, interaction beyond pressing Tab (no clicking, typing, or form submission), histories, billing, and automated code changes. Mobile viewports and keyboard simulation used to be on this list; both were built on September 2, 2026.
+10. The product intentionally excludes crawling, authentication, screenshots, screen-reader testing, interaction beyond pressing Tab and one synthetic paste event on password fields (no clicking, typing, or form submission), histories, billing, and automated code changes. Mobile viewports and keyboard simulation used to be on this list; both were built on September 2, 2026.
 
 ## Recommended next build
 
@@ -294,10 +315,10 @@ Agreed order for widening what the auditor detects. The `kind`/`detector` split 
 
 1. ~~Keyboard and focus walk.~~ Done, September 2, 2026.
 2. ~~Second viewport and reflow.~~ Done, September 2, 2026. Text resize at 200% (SC 1.4.4) was **not** built — bumping font sizes and detecting clipping produces too many false positives to assert as a failure. The 320px reflow test covers the same ground more defensibly.
-3. **Fake interactive elements** (`detector: heuristic`) — an element with a click listener but no role, no tabindex, and `cursor: pointer` is a button that assistive technology cannot see. Detect via CDP `DOMDebugger.getEventListeners`; the model only writes the suggested label.
+3. ~~Fake interactive elements.~~ Done, September 28, 2026 — `fake-interactive-element`. DevTools listeners alone would miss React, which attaches every handler to the root, so the check also reads framework props on the node.
 4. ~~Static form-error plumbing.~~ Done, September 28, 2026 — `aria-invalid` without described error text, asterisk-only required fields, error messages not referenced by their field, and `novalidate` forms on pages with no live region. The rule stands: **do not submit forms on third-party sites** to observe dynamic errors — that can create accounts, send messages, or trigger purchases on pages we do not own.
-5. **Accessible authentication (SC 3.3.8)** — paste blocked on password fields, missing `autocomplete="username"`/`"current-password"`, CAPTCHA present. Narrow, only fires on login pages, but nothing else reports it.
-6. **Vision alt-text review** (`detector: ai`) — last, behind a flag. Judging whether alt text is *meaningful* is the biggest quality gap, but it breaks the one-request-per-audit budget, and `image-alt` is deliberately always-manual-review because alt quality is human judgement. Ship as suggestions in the advisory tier, never as violations.
+5. ~~Accessible authentication (SC 3.3.8).~~ Done, September 28, 2026 — blocked paste as a violation; missing autocomplete hints and CAPTCHAs as advisories.
+6. ~~Vision alt-text review.~~ Done, September 28, 2026, behind `ALT_TEXT_REVIEW` — advisory only, `detector: ai`, one extra request per audit. A deterministic placeholder check (`alt-text-placeholder`) ships alongside it and runs on every scan.
 
 ## Product decisions to preserve
 
@@ -346,3 +367,10 @@ For every future change:
 - September 28, 2026 — Added static form checks. Two are violations because they are measured: a field announced as invalid with no described error text (3.3.1), and an asterisk with no `required` or `aria-required` (1.3.1). Two are advisories because they are inferred: an error message recognised by class name, and a `novalidate` form with no live region, where only a submit would show whether focus moves to the errors. That follows the September 2 pattern of choosing the kind for honesty.
 - September 28, 2026 — Left `aria-errormessage` to axe and reported only broken `aria-describedby` wiring ourselves. axe checks `aria-errormessage` thoroughly, but it files a dangling `aria-describedby` as "needs review", which this scanner never collects; that was the gap.
 - September 28, 2026 — Ran the form checks after the keyboard walk rather than first. Many sites validate a field on blur, so the Tab pass surfaces real error states without typing or submitting anything. It is the only way to see an error message on a third-party page that stays inside the no-submission rule.
+- September 28, 2026 — Detected click handlers three ways rather than through DevTools alone. `getEventListeners` sees only handlers attached to the element itself, and React attaches every handler to the root, so a DevTools-only check would have been silent on most modern apps. Reading `__reactProps$…` and Solid's `$$click` covers the delegating frameworks; hand-written delegation stays a known gap rather than a guess.
+- September 28, 2026 — Skipped pointer-cursor elements that contain a real link or button. A "clickable card" whose own click handler duplicates a link inside it already works by keyboard, and reporting it would have been the noisiest false positive this check could produce.
+- September 28, 2026 — Tested paste blocking with a synthetic, empty `paste` event. It is the smallest interaction that answers the question: nothing is typed, the field's value never changes, and nothing is submitted. It is the only exception to "no interaction beyond Tab", and is recorded as such in limitation 10.
+- September 28, 2026 — Made blocked paste a 3.3.8 violation but missing autocomplete and CAPTCHAs advisories. Paste blocking is measured and is exactly what 3.3.8 forbids. Browsers often guess without autocomplete hints, and object-recognition CAPTCHAs are allowed at AA, so neither can be asserted from markup.
+- September 28, 2026 — Added a deterministic placeholder-alt check before the AI review, on every scan. File names and placeholder words are a named WCAG failure (F30), so they need no model; that makes the most common bad alt text free to catch, and leaves the model only the judgement calls.
+- September 28, 2026 — Screenshotted images for the AI review from the rendered page instead of fetching their URLs. A Worker-side fetch of arbitrary image URLs would have been the first request in the product that skips the browser's request guard.
+- September 28, 2026 — Gave the optional passes a shared 45s budget. With seven of them at 20s each, a slow page could have run past the 90s job ceiling, and that fails the whole scan — losing the desktop axe results the passes exist to protect.
